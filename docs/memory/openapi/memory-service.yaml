@@ -1,0 +1,806 @@
+openapi: 3.0.3
+info:
+  title: DSH Big-Fish Companion Memory Service
+  version: 1.0.0
+  description: >
+    伴侣型长期记忆服务（t4）的内部 REST 契约。
+
+    调用方唯一：`bot-core`（DSH Cordis 插件，dsh 容器）。网络位置：`net-agent` internal，
+    监听 `172.28.0.50:8091`，**不发布宿主端口**；管理面 `127.0.0.1:8190` 仅 loopback。
+
+    信任模型：请求必须携带 HMAC 签名与结构化 principal 断言（channel/chat_id/user_id/role）。
+    服务端**不接受任何文本形式的身份声明**，也不接受自定 URL / 自定 SQL（C-03/C-05）。
+    role='public' 一律 403 —— 未过 ingress 授权闸的消息根本不该到达本服务（U1）。
+
+    设计文档：docs/memory/t4-memory-architecture.md §6/§7；ER 图：docs/memory/t4-memory-erd.md。
+  license:
+    name: Proprietary (internal prototype)
+
+servers:
+  - url: http://172.28.0.50:8091
+    description: internal net-agent only (no host publication, no egress route)
+
+security:
+  - botHmac: []
+
+tags:
+  - name: read
+    description: 只读路径（工具侧默认放行，仍写访问审计）
+  - name: write
+    description: 写入路径（工具侧 approval:ask；服务端二次校验审批令牌）
+  - name: delete
+    description: 遗忘路径（owner-only + 一次性审批令牌 + 物理删除）
+  - name: ops
+    description: 健康与运维（仅 8190 loopback 管理面）
+
+paths:
+  /v1/memories/search:
+    post:
+      tags: [read]
+      operationId: searchMemories
+      summary: 检索记忆（byte_trgm CJK + simple FTS + KV 精确三路融合）
+      description: >
+        返回内容一律以 `<memory-untrusted-{rand4}>` 封套包裹后由 bot-core 注入 prompt（arch §4.5）。
+        top-K ≤20 且总字符 ≤4000，超限置 truncated=true（E-1/E-4 成本护栏）。
+        每次调用都写 memory_access_log(operation='search')，object_ref 存查询的 sha256 而非原文（D-5）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+      responses:
+        '200':
+          description: 检索结果（可能为空数组，空结果不是错误）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          description: 请求体超过 32 KiB（抗 TM-012 灌量）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: 触发 per-sender/per-chat 速率上限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: PG 不可达或 degraded 熔断位生效（fail closed，不返回陈旧缓存冒充权威结果）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/memories/{memoryId}:
+    get:
+      tags: [read]
+      operationId: getMemory
+      summary: 读取单条记忆（含 PII 解密，解密行为本身入审计）
+      description: >
+        visibility ACL 在此判定：private 仅 subject 本人 DM 可读；peer 仅原会话内可读；
+        owner 仅 owner 会话可读；admin 永不对 agent 可见（arch §5.6）。
+        sensitivity>=pii 时执行 pgp_sym_decrypt 并额外写 operation='decrypt' 记录。
+      parameters:
+        - name: memoryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Bot-Principal
+          in: header
+          required: true
+          schema:
+            type: string
+          description: base64url(JSON{channel,chatId,userId,role,ts,nonce})，须与签名匹配
+      responses:
+        '200':
+          description: 记忆对象
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 不存在、已被物理删除、或因 ACL 不可见（三者返回同一响应以免探测）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/memories:
+    post:
+      tags: [write]
+      operationId: writeMemory
+      summary: 写入记忆（L2 upsert / L3 insert）
+      description: >
+        **前置条件**：调用方必须已获 DSH 审批（tools/pre-execute → {kind:'ask'} → allowed-once），
+        并在 X-Bot-Approval 头携带一次性审批令牌；缺失即 403 APPROVAL_REQUIRED（C-10/C-15）。
+        class 必须在 memory_class_policy 内且 requires_approval=false 时才允许免审批
+        （一期只有 sentiment/session_ctx 属此类）。
+
+        写侧消毒在落库前执行：剥离定界符残留、零宽/双向控制字符、长度按 class.max_body_chars 截断；
+        risk_tags 非空的候选**不入库**，转 profile_conflict（arch §4.5 规则 1）。
+        sensitivity='secret' 一律拒绝（DB CHECK 为第二道）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteRequest'
+      responses:
+        '201':
+          description: 已创建（或幂等命中既有行 → deduped=true，不新建）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResult'
+        '200':
+          description: 冲突未覆盖——已进 profile_conflict 队列，等待 owner 裁决（arch §4.4）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: 幂等窗口内的重复提交（同 idempotencyKey 且载荷不同）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: 类别被拒（MEMORY_REFUSED_CATEGORY，典型为 secret 类）或消毒后正文为空
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/memories/{memoryId}/forget:
+    post:
+      tags: [delete]
+      operationId: forgetMemory
+      summary: 遗忘单条记忆（物理删除 + tombstone）
+      description: >
+        owner-only。dry_run=true 返回将被删除的清单摘要（不含正文），供审批文案使用；
+        dry_run=false 必须携带一次性审批令牌，否则 DB 层亦会拒绝（forget 函数不授予服务角色）。
+        删除顺序：先写 tombstone（不可逆摘要）→ DELETE（CASCADE 清 embedding/conflict）→ VACUUM 相关页。
+      parameters:
+        - name: memoryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/ApprovalHeader'
+        - $ref: '#/components/parameters/DryRun'
+      responses:
+        '200':
+          description: 删除完成（或 dry-run 清单）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForgetResult'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 目标不存在或已被删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/subjects/{subjectKey}/forget-all:
+    post:
+      tags: [delete]
+      operationId: forgetSubject
+      summary: 全量遗忘某主体（需清单式一次审批 + 强制备份轮换标记）
+      description: >
+        对应 arch §5.4 的"清单式一次审批"路径：避免上百次弹窗造成审批疲劳（本身是安全风险）。
+        执行后置 artifact_baseline 的 backup_rotated 待办标记；实际备份轮换由作业完成（arch §8.6，R-6）。
+      parameters:
+        - name: subjectKey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z0-9_]+:[a-z]+:.+$'
+        - $ref: '#/components/parameters/ApprovalHeader'
+        - $ref: '#/components/parameters/DryRun'
+      responses:
+        '200':
+          description: 删除结果或 dry-run 清单
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForgetResult'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/context/{peerKey}:
+    get:
+      tags: [read]
+      operationId: getContext
+      summary: 读取 L1 短期上下文（SQLite 缓存）
+      description: >
+        由 bot-core 在投递前自动注入，**不作为模型可见工具**（arch §6.1）。
+        L1 是可丢弃缓存：miss 时返回 exists=false 而非 404，服务据 PG 重建。
+        sensitivity>=pii 的值禁止进入 L1（SQLite CHECK 强制）。
+      parameters:
+        - name: peerKey
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 当前上下文槽位
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [write]
+      operationId: putContext
+      summary: 写入 L1 短期上下文（免审批，24h TTL）
+      description: >
+        allow_auto_write=true 的 class 走此路径（session_ctx/sentiment），因此**不需要**审批令牌。
+        容量触顶（max_page_count）时丢弃最旧 slot 并重试，不阻塞请求。
+      parameters:
+        - name: peerKey
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContextPutRequest'
+      responses:
+        '200':
+          description: 已写入
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextPutResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: 存活与依赖探针（仅 8190 管理面）
+      security: []
+      responses:
+        '200':
+          description: 健康
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: PG 或 SQLite 不可用（watcher 据此告警，不经 LLM，F-2）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    botHmac:
+      type: apiKey
+      in: header
+      name: X-Bot-Sig
+      description: >
+        hmac_sha256(secret, method||path||body||principal)，base64url。
+        服务端另校验 ts 偏移 ≤5s 与 nonce 未重放（LRU 10k）。
+        密钥与 SUB 跳同源派生（O-8），agent 无法参与这段字节的生产 → 身份不可被提示词伪造。
+
+  parameters:
+    ApprovalHeader:
+      name: X-Bot-Approval
+      in: header
+      required: false
+      description: 一次性审批令牌（allowed-once）。非 dry-run 的删除必需。
+      schema:
+        type: string
+        minLength: 8
+    DryRun:
+      name: dryRun
+      in: query
+      required: false
+      description: true 时仅返回清单，不动数据。默认 true（fail-safe）。
+      schema:
+        type: boolean
+        default: true
+
+  responses:
+    BadRequest:
+      description: schema 严格校验失败（未知字段、枚举外值、超长）——不做宽容解析（C-23）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: HMAC 缺失/不匹配、时间戳越界或 nonce 重放
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: ACL 拒绝、role=public、缺审批令牌、或跨 peer 边界
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: 依赖不可达（PG/SQLite）或 degraded 熔断位生效
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    MemoryClass:
+      type: string
+      description: 封闭枚举，与 companion.memory_class 一一对应（arch §2.2）
+      enum: [profile, preference, commitment, episode, sentiment, session_ctx, pii_raw]
+
+    Sensitivity:
+      type: string
+      description: 敏感度分级（arch §5.1）。secret 只用于拒绝，不可存储。
+      enum: [public, internal, pii, secret]
+
+    Visibility:
+      type: string
+      enum: [private, peer, owner, admin]
+
+    RiskTag:
+      type: string
+      description: 透传 ingress 的打标结果（A6：打标不静默丢弃）
+      enum: [instruction-override, encoded-payload, zero-width, credential-path,
+             offallowlist-url, oversize, unknown-segment, memory-poison-suspect]
+
+    SearchRequest:
+      type: object
+      additionalProperties: false     # 严格：未知字段直接 400（C-23）
+      required: [query, principal]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 512
+        principal:
+          $ref: '#/components/schemas/Principal'
+        class:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryClass'
+          maxItems: 7
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 10
+        since:
+          type: string
+          format: date-time
+        until:
+          type: string
+          format: date-time
+        includeExpired:
+          type: boolean
+          default: false
+          description: 恒不影响已过期的行——过期即物理删除，此参数只影响即将到期的项
+
+    Principal:
+      type: object
+      additionalProperties: false
+      required: [channel, chatId, userId, role]
+      description: >
+        结构化身份，来自 ingress 判决后的 session binding（arch §5.3.1/§5.3.5）。
+        **无 displayName 字段**：显示名永不参与判决（C-03/A-2）。
+      properties:
+        channel:
+          type: string
+          pattern: '^[a-z0-9_]+$'
+        chatId:
+          type: string
+          maxLength: 128
+        userId:
+          type: string
+          maxLength: 128
+        role:
+          type: string
+          enum: [owner, trusted]
+          description: public 不允许出现在到达本服务的请求中；出现即 403
+        sessionId:
+          type: string
+          description: DSH session id，用于 tools.guard 身份一致性核对
+
+    WriteRequest:
+      type: object
+      additionalProperties: false
+      required: [subjectKey, class, body, principal]
+      properties:
+        subjectKey:
+          type: string
+          pattern: '^[a-z0-9_]+:[a-z]+:.+$'
+        class:
+          $ref: '#/components/schemas/MemoryClass'
+        scope:
+          type: string
+          enum: [global, dm, group]
+          default: dm
+        scopePeer:
+          type: string
+          maxLength: 128
+        body:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: 服务端按 class.max_body_chars 二次截断，并在落库前消毒（arch §4.5）
+        attrKey:
+          type: string
+          maxLength: 128
+          description: L2 KV 键；同 subject+attrKey 走 upsert 版本链
+        sensitivity:
+          $ref: '#/components/schemas/Sensitivity'
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.5
+        occurredAt:
+          type: string
+          format: date-time
+        sourceRef:
+          type: string
+          maxLength: 256
+          description: 引用（如 chat:<message_id>），不落原文
+        riskTags:
+          type: array
+          items:
+            $ref: '#/components/schemas/RiskTag'
+        idempotencyKey:
+          type: string
+          maxLength: 128
+        ttlDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
+          description: 仅覆盖 policy 的缩短请求；不得延长（policy 是上界）
+
+    ContextPutRequest:
+      type: object
+      additionalProperties: false
+      required: [slot, value]
+      properties:
+        slot:
+          type: string
+          enum: [topic_stack, pending_question, entity_alias, last_intent]
+        value:
+          type: object
+          additionalProperties: true
+          description: JSON 对象；序列化后 ≤8 KiB
+        sensitivity:
+          type: string
+          enum: [public, internal]
+          default: internal
+          description: 刻意不含 pii/secret——L1 不承载敏感值（SQLite CHECK 为第二道）
+        sourceMsgId:
+          type: string
+          maxLength: 128
+
+    Memory:
+      type: object
+      additionalProperties: false
+      required: [memoryId, kind, class, sensitivity, visibility, createdAt]
+      properties:
+        memoryId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [episode, profile, preference, fact]
+        subjectId:
+          type: string
+          format: uuid
+        class:
+          $ref: '#/components/schemas/MemoryClass'
+        body:
+          type: string
+          description: 明文（服务侧解密后的结果）。**客户端负责包 untrusted 封套**，本服务不返回裸文本给模型。
+        attrKey:
+          type: string
+        sensitivity:
+          $ref: '#/components/schemas/Sensitivity'
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        confidence:
+          type: number
+        hitCount:
+          type: integer
+        occurredAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        riskTags:
+          type: array
+          items:
+            $ref: '#/components/schemas/RiskTag'
+        provenance:
+          type: object
+          additionalProperties: false
+          description: 来源链，供模型自行降权（arch §4.5 规则 2）
+          properties:
+            sourceChannel:
+              type: string
+            sourceRef:
+              type: string
+            createdByIdentity:
+              type: string
+              description: 谁写的（结构化 user_id，非显示名）
+        conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConflictSummary'
+
+    ConflictSummary:
+      type: object
+      additionalProperties: false
+      required: [conflictId, attrKey, reason, status]
+      description: 冲突项摘要（不含正文），让模型显式表达不确定而非编造确定性（arch §4.4）
+      properties:
+        conflictId:
+          type: string
+          format: uuid
+        attrKey:
+          type: string
+        reason:
+          type: string
+          enum: [contradiction, low_confidence, risk_tagged, promotion_candidate]
+        status:
+          type: string
+          enum: [open, resolved_keep_old, resolved_keep_new, expired, rejected_poison]
+        firstSeenAt:
+          type: string
+          format: date-time
+
+    SearchResponse:
+      type: object
+      additionalProperties: false
+      required: [results, truncated, tookMs]
+      properties:
+        results:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/Memory'
+        truncated:
+          type: boolean
+          description: true 表示因 4000 字符预算被裁
+        strategy:
+          type: object
+          additionalProperties: false
+          description: 召回构成，便于观测"记不住"的真实原因（arch §11 R-5）
+          properties:
+            kvHits:
+              type: integer
+            byteTrigramHits:
+              type: integer
+            ftsHits:
+              type: integer
+            trgmHits:
+              type: integer
+        tookMs:
+          type: integer
+        accessLogId:
+          type: string
+          description: 本次检索的审计行标识（opaque）
+
+    WriteResult:
+      type: object
+      additionalProperties: false
+      required: [memoryId, deduped, conflict]
+      properties:
+        memoryId:
+          type: string
+          format: uuid
+        deduped:
+          type: boolean
+          description: true 表示命中既有行，仅 bump hit_count/last_seen_at，未新建（arch §4.1）
+        conflict:
+          type: boolean
+          description: true 表示未覆盖既有值，已进 profile_conflict 队列（arch §4.4）
+        encrypted:
+          type: boolean
+        sanitizedRiskTags:
+          type: array
+          items:
+            type: string
+          description: 消毒过程中命中的风险标记名（不含 payload 原文，D-5）
+        version:
+          type: integer
+
+    ForgetResult:
+      type: object
+      additionalProperties: false
+      required: [dryRun, deletedCount]
+      properties:
+        dryRun:
+          type: boolean
+        deletedCount:
+          type: integer
+        tombstones:
+          type: array
+          maxItems: 200
+          description: 不可逆摘要清单（sha256），供审批文案与回执核对；绝不含正文
+          items:
+            type: object
+            additionalProperties: false
+            required: [objectKind, objectHash, class]
+            properties:
+              objectKind:
+                type: string
+                enum: [episode, profile, preference, fact]
+              objectHash:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+              class:
+                $ref: '#/components/schemas/MemoryClass'
+              preview:
+                type: string
+                maxLength: 24
+                description: 仅 owner 主动要求预览时返回的前 8 字符脱敏片段（arch §5.3）
+        backupNote:
+          type: string
+          description: 提醒"备份中含已删数据直至下次轮换"（arch §8.6 / R-6）
+
+    ContextResponse:
+      type: object
+      additionalProperties: false
+      required: [peerKey, exists]
+      properties:
+        peerKey:
+          type: string
+        exists:
+          type: boolean
+          description: false = 缓存 miss（正常状态，非错误）；服务据 PG 重建
+        slots:
+          type: object
+          additionalProperties: true
+        turnWindow:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [role, summary]
+            properties:
+              role:
+                type: string
+                enum: [inbound, outbound]
+              summary:
+                type: string
+                maxLength: 200
+        ttlRemainingSeconds:
+          type: integer
+        promotedCandidates:
+          type: integer
+
+    ContextPutResult:
+      type: object
+      additionalProperties: false
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+        evictedSlots:
+          type: integer
+          description: 因容量触顶被丢弃的最旧 slot 数（arch §8.5 防灌爆）
+        expiresAt:
+          type: string
+          format: date-time
+
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, pg, sqlite]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        pg:
+          type: object
+          additionalProperties: false
+          required: [up]
+          properties:
+            up:
+              type: boolean
+            latencyMs:
+              type: integer
+        sqlite:
+          type: object
+          additionalProperties: false
+          required: [up]
+          properties:
+            up:
+              type: boolean
+            dbBytes:
+              type: integer
+            pageCapPct:
+              type: number
+              description: 接近 max_page_count 的百分比（容量预警）
+        jobs:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [job, ageSeconds]
+            properties:
+              job:
+                type: string
+              ageSeconds:
+                type: integer
+                description: >
+                  距上次成功执行的秒数。>26h 视为沉默，watcher 据此告警（arch §8.1 / E-7）。
+        version:
+          type: string
+
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      description: >
+        错误码为封闭词汇表。**message 必须是给人看的脱敏文本**：不含堆栈、绝对路径、SQL、
+        环境变量名（A-7/TM-011）。诊断细节留在服务端日志与 session log。
+      properties:
+        code:
+          type: string
+          enum: [BAD_REQUEST, UNKNOWN_FIELD, UNKNOWN_CLASS, UNAUTHENTICATED, NONCE_REPLAY,
+                 FORBIDDEN_ROLE, ACL_DENIED, PEER_BOUNDARY_VIOLATION, APPROVAL_REQUIRED,
+                 APPROVAL_INVALID, MEMORY_REFUSED_CATEGORY, SANITIZED_EMPTY, IDEMPOTENCY_CONFLICT,
+                 BODY_TOO_LARGE, RATE_LIMITED, DEPENDENCY_UNAVAILABLE, DEGRADED_HALT, INTERNAL]
+        message:
+          type: string
+          maxLength: 300
+        details:
+          type: object
+          additionalProperties: true
+          description: 仅安全字段（如 offending field name），绝不回显输入内容
+        accessLogId:
+          type: string
