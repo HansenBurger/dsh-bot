@@ -1,0 +1,9 @@
+{
+  "name": "@dsh-bot/bot-normalize",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NormalizedMessage / OutboundPart vocabulary + strict OB11 frame parsing (t3 arch §5.4). Zero runtime dependencies.",
+  "main": "src/index.mjs",
+  "exports": { ".": "./src/index.mjs" }
+}

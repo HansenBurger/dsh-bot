@@ -41,3 +41,11 @@ tmp/
 *.swp
 *.swo
 *~
+
+# Local prototype runtime (never commit real credentials or container state)
+secrets/
+*.db
+*.db-wal
+*.db-shm
+.env.local
+pgdata-test/

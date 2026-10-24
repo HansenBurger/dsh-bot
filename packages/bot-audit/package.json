@@ -1,0 +1,9 @@
+{
+  "name": "@dsh-bot/bot-audit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared bot-audit primitives for the DSH big-fish companion prototype.",
+  "main": "src/index.mjs",
+  "exports": { ".": "./src/index.mjs" }
+}
