@@ -134,7 +134,9 @@ scripts/               集成与端到端验证脚本
 
 ## 已知限制（原型阶段）
 
-* 没有真实 QQ 号时，回复链路只能由 `scripts/ingress-e2e.mjs` 扮演的假适配器闭环。
+* QQ 主链路已用真实账号跑通（白名单私信 → echo 回执回到 QQ，陌生人私信被 default-deny 拒绝，
+  见 [runbook 第 3 节](docs/validation/qq-channel-runbook.md)）；`scripts/ingress-e2e.mjs`
+  扮演的假适配器仍在，用途变成回归覆盖而不是唯一证据来源。
 * **Telegram 通道整体 deferred（本原型不启用）**：本机到 `api.telegram.org` 网络不可达
   （调研期已证实，也是此前“卡住”的根因）。适配器代码与出站/长轮询实现保留，单测对着本地
   假 API 跑通（`apps/gateway/test/telegram.test.mjs`，11 项，全程不联网），但没有真实 TG
@@ -145,12 +147,23 @@ scripts/               集成与端到端验证脚本
   与 Hub tag API 双源一致，见 [runbook 第 1 节](docs/validation/qq-channel-runbook.md)）；
   `deploy/seccomp/napcat.json` 仍是占位，因此 NapCat 目前跑在 Docker 默认 seccomp profile 下，
   需要自定义策略时用绝对路径 `NAPCAT_SECCOMP_PROFILE=/abs/napcat.json`（相对路径对 daemon 无效）。
-* **NapCat 容器实际以 uid 1000 运行，不是基线里的 2100**：镜像的 `entrypoint.sh` 靠
-  `usermod` 改 `/etc/passwd` 来落地 `NAPCAT_UID`，而 `read_only: true` 让 `/etc` 不可写，
-  于是 `gosu napcat` 落到镜像内建 uid 1000（容器内 `ps` 实测）。降权仍然生效（不是 root），
-  且容器只挂 `data/{qq,napcat-app,napcat-config,napcat-plugins}` 四个目录，宿主工作区与
-  `deploy/secrets/*` 不在其中。彻底修法需要自建派生镜像预置 passwd 再重新固化 digest，
-  待 t3 安全定级后另开任务。
+* **协议容器以 uid 1000 运行，偏离 t3 基线的 2100（现在是主动选择，不是静默错配）**：镜像的
+  `entrypoint.sh` 靠 `usermod` 改 `/etc/passwd` 落地 `NAPCAT_UID`，而 `read_only: true` 让
+  `/etc` 不可写，`gosu napcat` 只会落到镜像内建 uid 1000；与此同时它每次启动都按 `NAPCAT_UID`
+  把挂载目录 chown 回去，所以声明 2100 会让 uid 1000 的 QQ 进程对 `0700` 的 `data/qq` 持续
+  Permission denied，登录服务每 40s 重置、二维码活不到被扫。因此 `NAPCAT_UID/GID` 设为 1000
+  与宿主目录属主一致。降权仍有效（不是 root），容器只挂 `data/{qq,napcat-app,napcat-config,
+  napcat-plugins}` 四个目录，宿主工作区与 `deploy/secrets/*` 不在其中。要真正满足 2100 需要
+  自建派生镜像预置 passwd 再重新固化 digest，待 t3 安全定级后另开任务。
+* **`net-qq` 是本机唯一给协议容器直连 WAN 的网络（新增偏差，需 t3 正式定级）**：QQ 客户端必须
+  直连腾讯 login/msf 服务器（raw TCP/QUIC），squid 白名单代理不了这类流量，所以协议容器无法
+  像其他平面一样只走 internal 网。`net-qq` 是 bridge + masquerade 且排在 `networks` 首位以承载
+  默认路由；其余服务的网络策略未改动。这是 QQ 协议端的固有属性，不是实现偷懒。
+* **WebUI 曾临时发布在 `0.0.0.0:3081`（2026-10-24 约 22:00–22:44 +08）并已回退**：操作者从远程
+  设备管理这台 VM，够不到 `127.0.0.1:3081`，只能短暂开到 LAN 完成一次性扫码；登录采纳后立即
+  改回 loopback-only（commit `b3994fa`），期间暴露面叠加了上一条「日志明文打 WebUI token」，
+  因此那段时间的 `docker compose logs napcat` 与 LAN 上的 3081 都按已泄露处理，
+  建议后续轮换 `NAPCAT_WEBUI_TOKEN`。
 * **NapCat 会把 WebUI token 明文写进容器日志**（上游行为，不改镜像无法关闭），因此
   `docker compose logs napcat` 属敏感输出；t3 时再评估是否要做日志脱敏。
 * `--profile ops` 的 watcher/collector 目前是最小实现，只做降级旗标与心跳读取。

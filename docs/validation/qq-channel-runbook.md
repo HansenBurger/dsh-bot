@@ -9,9 +9,11 @@ bot-core → DSH 生成回复 → 发回 QQ**，并要求同时观测“非白�
 |---|---|---|
 | 编排/网络/env 契约 | ✅ 与上游文档核对一致 | `MODE=reverse_ws` + `ONEBOT_URL`、`WEBUI_TOKEN`、`NAPCAT_UID/GID`、三个挂载目录（`/app/.config/QQ`、`/app/napcat/config`、`/app/napcat/plugins`）均与 `NapNeko/NapCat-Docker` README 一致；WebUI 容器端口 6099 → 宿主 `127.0.0.1:3081` |
 | ingress 反向 WS 监听 | ✅ 已实测 | `127.0.0.1:3001` 已发布；`node scripts/ingress-e2e.mjs` 13/13（假适配器扮 NapCat，含 token 指纹、self_id 钉死、白名单拒绝、限流、审计无凭据） |
-| 数据目录权限 | ✅ | `data/{qq,napcat-config,napcat-plugins}` 已建并 `chown 2100:2100`（上游明确要求挂载目录对运行用户可读写） |
+| 数据目录权限 | ✅ | `data/{qq,napcat-app,napcat-config,napcat-plugins}` 存在且属主与 `NAPCAT_UID` 一致（现为 1000:1000；上游要求挂载目录对运行用户可读写，属主不一致会让登录服务反复重置） |
 | 镜像 digest 核验与固化 | ✅ 已完成（双源一致） | `v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e`，由 `docker buildx imagetools inspect` 与 Hub tag API 交叉核验一致，已写入 `deploy/compose.yaml`（commit `7c80935`）。**t3 G3 的 digest 门禁至此才算满足。** |
-| **NapCat 启动 + 扫码登录** | ⏸ 等用户扫码 | 镜像拉取在宿主后台进行中；拉到位后按第 2 节 bring-up，停在扫码处等人工 |
+| **NapCat 启动 + 扫码登录** | ✅ 已完成 | 小号 `207346792` 一次性人工扫码登录；之后容器重建走 `ACCOUNT` 快速登录，会话保存在 `data/qq` |
+| **真实 QQ 端到端** | ✅ 已完成 | 主人私信 → echo 回执回到真实 QQ；陌生号私信被 default-deny 拒绝。逐条证据见第 3.5 节 |
+| 记忆链路（真实 QQ 驱动） | ⚠ 不在 echo 口径内 | `BOT_CORE_MODE=echo` 不调模型，也就不会走 `memory_write`；真实消息不产生记忆写入（实测 L1 真号 peer 行数 0）。记忆子系统对真存储 24/24 |
 
 第 1 步失败的真实根因不是网络，而是**任务书里那个 tag 不存在**：`mlikiowa/napcat-docker`
 没有 `0.01.11` 这个 tag（此前所有 `not found`/超时都掩盖了这一点），当前真实 tag 是
@@ -157,6 +159,44 @@ timeout 240 docker run --rm --network bot-net-protocol -v $PWD:/host:ro -w /host
 **这条证据的边界要诚实说明**：扮演 NapCat 的仍是脚本，不是真 QQ 账号。它证明
 “反向 WS 通路 + 白名单判决 + 回程动作”在真实网络位置上可用，不证明腾讯侧的
 登录/风控/消息格式细节——那需要第 2 节的人工扫码。
+
+## 3.5 真实 QQ 端到端证据（2026-10-24，小号 207346792）
+
+**NapCat 自己的收发日志（腾讯侧真实账号，非脚本扮演）**：
+
+```text
+10-24 22:15:54 [info] 汉森Burger | 接收 <- 私聊 (1035376945) 你好
+10-24 22:15:54 [info] 汉森Burger | 发送 -> 私聊 (1035376945) 收到（prototype intake，未调用模型）：你好
+10-24 22:40:36 [info] 汉森Burger | 接收 <- 私聊 (952010048) 请求添加你为好友
+```
+
+**同一时刻的 ingress 审计（`logs/ingress.jsonl`）**：
+
+```json
+{"ts":1792851354…,"type":"authz.decision","stage":"gate","peerKind":"dm","role":"owner","result":"allowed"}
+{"ts":1792851354…,"type":"authz.decision","stage":"submit","result":"allowed","status":200,"ms":23,"role":"owner"}
+{"ts":1792852836…,"type":"authz.decision","stage":"gate","peerKind":"dm","role":null,"result":"denied","reason":"not-whitelisted","structuredIds":true}
+{"ts":1792852915…,"type":"authz.decision","stage":"gate","peerKind":"dm","role":null,"result":"denied","reason":"not-whitelisted","structuredIds":true}
+```
+
+对应关系是逐秒吻合的：`22:15:54` 白名单 owner 放行并以 HTTP 200 提交到 bot-core，回程帧
+`send_private_msg` 由 NapCat 落进上一条日志；`22:40:36`/`22:41:55` 是真实陌生号私信，
+判决 `denied reason=not-whitelisted`，**其后没有任何 `submit` 审计行**，即零次上游调用；
+`structuredIds:true` 说明判决只用 `(channel, chat_id, user_id)`，昵称「请求添加你为好友」
+这类展示字段没有参与授权，也没被写进审计。
+
+**用户侧确认**：用户收到回复原文「收到（prototype intake，未调用模型）：你好」。
+
+**登录态跨重建验证**：回退 WebUI 端口后容器重建，日志出现
+`正在快速登录 207346792`，审计随后 `connected`（socket `172.28.0.20:n66w1a`）且无
+`self-id-mismatch`。注意 `ACCOUNT` 必填（compose 里从 `SELF_ID` 插值）：不传时镜像永远展示
+新二维码，`data/qq` 里保存的凭据根本不参与登录。
+
+**记忆链路的诚实边界**：echo 口径下模型不参与，`memory_write` 工具不会被调用，所以两条真
+QQ 消息**不会**写入记忆（实测 `context_entry` 中真号 peer 行数 0，仅有一条 19:44 原型 peer
+的历史行）。记忆子系统对真存储的读写用 `scripts/memory-e2e.mjs` 在容器内实测 **24/24**
+（SQLite L1 + 宿主 PG：写/读/中文检索/审批删除/墓碑/访问账本）。“真实 QQ 消息驱动记忆”
+要等接上模型的那条后续任务。
 
 ## 4. Telegram：明确 deferred（不在本任务范围）
 
