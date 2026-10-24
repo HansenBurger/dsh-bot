@@ -2,21 +2,25 @@
 # verify-napcat-digest — resolve the immutable digest behind mlikiowa/napcat-docker:<tag>
 # and (with --pin) write it into deploy/compose.yaml.
 #
+# The pin in use today is v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e,
+# cross-verified against two sources (buildx imagetools + the Hub tag API). Use this
+# script when upgrading the tag, or to re-confirm the digest after a compose change.
+#
 # Run this on a machine that can reach Docker Hub. This project pins third-party
 # protocol images by digest (t3 G3) because NapCat is unauditable code that holds the QQ
 # session (axiom 3): a tag can be moved under us, a digest cannot.
 #
 #   bash scripts/verify-napcat-digest.sh                 # print the digest
 #   bash scripts/verify-napcat-digest.sh --pin            # rewrite compose.yaml
-#   NAPCAT_IMAGE=mlikiowa/napcat-docker:0.01.11 bash scripts/verify-napcat-digest.sh
+#   NAPCAT_IMAGE=mlikiowa/napcat-docker:v4.18.41 bash scripts/verify-napcat-digest.sh
 #
 # If you use crane or skopeo instead of the docker CLI:
-#   crane digest mlikiowa/napcat-docker:0.01.11
-#   skopeo inspect --format '{{.Digest}}' docker://mlikiowa/napcat-docker:0.01.11
+#   crane digest mlikiowa/napcat-docker:v4.18.41
+#   skopeo inspect --format '{{.Digest}}' docker://mlikiowa/napcat-docker:v4.18.41
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NAPCAT_IMAGE:-mlikiowa/napcat-docker:0.01.11}"
+IMAGE="${NAPCAT_IMAGE:-mlikiowa/napcat-docker:v4.18.41}"
 PIN=0
 [[ "${1:-}" == "--pin" ]] && PIN=1
 
