@@ -4,10 +4,10 @@
   "entries": [
     {
       "channel": "onebot",
-      "chatId": "100012345",
-      "userId": "100012345",
+      "chatId": "1035376945",
+      "userId": "1035376945",
       "role": "owner",
-      "note": "主人私聊（DM 的 chat_id 等于其 QQ 号）"
+      "note": "主人 1035376945 的 QQ 私聊（DM 的 chat_id 等于其 QQ 号）；机器人自身号 207346792"
     },
     {
       "channel": "telegram",
@@ -15,13 +15,6 @@
       "userId": "777000000",
       "role": "owner",
       "note": "主人 TG 私聊，审批消息走这里"
-    },
-    {
-      "channel": "onebot",
-      "chatId": "987654321",
-      "userId": "100012345",
-      "role": "trusted",
-      "note": "群聊中的主人：可对话，不可删除记忆（guard 只放行 owner）"
     }
   ]
 }
