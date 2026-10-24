@@ -29,6 +29,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { AuditSink } from '@dsh-bot/bot-audit';
 import { authorize, canLlmEgress, identify, refsFor } from './policy.mjs';
+import { upstreamRequestOptions } from './proxy-tunnel.mjs';
 
 const MAX_SECRET_BYTES = 4096;
 const LOG = (o) => process.stderr.write(`${JSON.stringify({ ts: Date.now(), service: 'secret-broker', ...o })}\n`);
@@ -180,23 +181,34 @@ export class SecretBroker {
     }
 
     const target = new URL(url.pathname.replace(/^\/v1\/llm/, '') + url.search, this.upstreamBase);
+    // Second anti-SSRF layer (squid's dstdomain allowlist + `deny dshbot_internal` is the
+    // first): the host we tunnel to must be exactly the configured upstream. A CONNECT to
+    // an internal address through our own proxy would otherwise be a pivot to the memory
+    // service, the broker admin port, or the host.
+    const upstreamHost = new URL(this.upstreamBase).hostname;
+    if (target.hostname !== upstreamHost) {
+      this.counters.llmDenied += 1;
+      this.audit.emit('sandbox.denied', { stage: 'llm-egress', clientId, result: 'denied', reason: 'upstream-host-mismatch', targetHost: target.hostname });
+      return this.#send(res, 400, { error: { code: 'UPSTREAM_HOST_MISMATCH', message: '只允许访问配置的模型上游主机' } });
+    }
     const request = target.protocol === 'https:' ? httpsRequest : httpRequest;
     const hopHeaders = { ...req.headers };
     for (const h of ['authorization', 'cookie', 'proxy-authorization', 'x-broker-token', 'x-bot-principal', 'x-bot-sig', 'host', 'connection', 'keep-alive', 'transfer-encoding']) delete hopHeaders[h];
 
     const started = Date.now();
+    const { options: baseOptions, via } = upstreamRequestOptions(target, {
+      method: req.method,
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      headers: { ...hopHeaders, authorization: `Bearer ${key}`, accept: req.headers.accept || 'application/json' },
+    });
     const upstream = request(
-      {
-        method: req.method,
-        protocol: target.protocol,
-        hostname: target.hostname,
-        port: target.port || (target.protocol === 'https:' ? 443 : 80),
-        path: `${target.pathname}${target.search}`,
-        headers: { ...hopHeaders, authorization: `Bearer ${key}`, accept: req.headers.accept || 'application/json' },
-      },
+      baseOptions,
       (up) => {
         this.counters.llmForwarded += 1;
-        this.audit.emit('llm.egress', { clientId, target: `${target.host}${target.pathname}`, status: up.statusCode, ms: Date.now() - started });
+        this.audit.emit('llm.egress', { clientId, target: `${target.host}${target.pathname}`, status: up.statusCode, ms: Date.now() - started, via });
         const outHeaders = { ...up.headers };
         // Never forward an upstream Set-Cookie from an LLM API, and drop any header
         // that could carry the injected credential back to the caller.
@@ -206,7 +218,12 @@ export class SecretBroker {
       },
     );
     upstream.on('error', (err) => {
-      this.audit.emit('llm.egress', { clientId, result: 'error', message: String(err.message).slice(0, 100), ms: Date.now() - started });
+      this.counters.llmDenied += 1;
+      // egressReason is set by proxy-tunnel: `proxy-denied` means our own allowlist said
+      // no (policy event), `proxy-unreachable` means the egress leg is down (availability
+      // event). Never fall back to a direct connection here — a proxy that silently stops
+      // filtering is the exfiltration path this file exists to close.
+      this.audit.emit('llm.egress', { clientId, result: 'error', reason: err.egressReason || 'upstream-error', message: String(err.message).slice(0, 100), ms: Date.now() - started, via });
       if (!res.headersSent) this.#send(res, 502, { error: { code: 'UPSTREAM_UNREACHABLE', message: '模型上游不可达' } });
       else res.end();
     });
