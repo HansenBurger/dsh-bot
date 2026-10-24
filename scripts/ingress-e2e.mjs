@@ -1,27 +1,41 @@
 /**
- * ingress-e2e — drive the published reverse-WS surface of the running stack.
+ * ingress-e2e — drive the reverse-WS gate end to end.
  *
- * Run on the host against `docker compose up`ed containers:
- *   node scripts/ingress-e2e.mjs
+ * Two targets, and the **default is the isolated one** because this script *injects*
+ * messages: pointed at the live stack with live principals it would make the companion
+ * answer a real person on QQ and would leave test traffic in the production audit trail.
  *
- * It plays the role of NapCat: connects to 127.0.0.1:3001 (the only published ingress
- * port, C4), presents the access token, posts events and answers API calls. Nothing here
- * reaches the LLM or the memory service directly — the point is to watch the A1 gate and
- * the audit trail react.
+ *   node scripts/ingress-e2e.mjs                 # isolated: in-process gateway + intake,
+ *                                               # ephemeral ports, synthetic ids, temp audit
+ *   E2E_TARGET=live E2E_ALLOW_LIVE=1 node scripts/ingress-e2e.mjs
+ *                                               # the published listener, principals read
+ *                                               # from deploy/whitelist.json (never hardcoded)
+ *
+ * Isolated mode boots the *real* `createGateway()` and the *real* `IntakeServer`, so the
+ * signature / nonce / role checks on the SUB hop are exercised rather than simulated, and
+ * it refuses to run if anything would touch `logs/ingress.jsonl`. Nothing here reaches the
+ * LLM, the memory service, or a chat platform — the point is to watch the A1 gate and the
+ * audit trail react.
  *
  * Checks (acceptance #2 plus the E-layer):
- *   W1 a wrong access token is closed with 1008 before any event is read
- *   W2 a non-whitelisted sender is refused and the refusal is audited
- *   W3 a whitelisted owner DM round-trips to the agent plane and the reply comes back
- *   W4 display-name-like noise in the payload cannot authorise anyone (structured ids only)
- *   W5 flooding the whitelisted sender trips the per-sender rate limit
- *   W6 no plaintext credential appears in the audit sink
+ *   W1  a wrong access token is closed with 1008 before any event is read
+ *   W1b that refusal is audited as a fingerprint mismatch
+ *   W7  an adapter claiming a foreign self_id is dropped
+ *   W2  a non-whitelisted sender is refused, audited, and gets no reply
+ *   W3  a whitelisted owner DM round-trips to the agent plane and the reply comes back
+ *   W4  display-name / self-declared identity noise cannot authorise anyone
+ *   W5  flooding the whitelisted sender trips the per-sender rate limit
+ *   W6  the audit sink grows and never contains credential material
  */
 
 import { WebSocket } from 'ws';
-import { readFileSync, existsSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { resolve } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { AuditSink } from '@dsh-bot/bot-audit';
+import { createGateway } from '../apps/gateway/src/index.mjs';
+import { IntakeServer } from '../apps/bot-core/src/intake.mjs';
 
 const ENV_PATH = resolve('deploy/.env');
 const env = {};
@@ -31,21 +45,97 @@ if (existsSync(ENV_PATH)) {
     if (m) env[m[1]] = m[2];
   }
 }
-const SELF_ID = String(env.SELF_ID || '100012345');
-// Prefer the real credential the stack is pinning (deploy/secrets/napcat-ob11-access-token,
-// gitignored, 0600); fall back to the prototype string only for throwaway local runs. The
-// fingerprint in deploy/.env decides which of the two the gateway will accept.
-const TOKEN =
-  process.env.E2E_OB11_TOKEN ||
-  (existsSync('deploy/secrets/napcat-ob11-access-token')
-    ? readFileSync('deploy/secrets/napcat-ob11-access-token', 'utf8').trim()
-    : 'prototype-token-for-local-verification');
-const FP = createHash('sha256').update(TOKEN).digest('hex');
-const URL_BASE = process.env.E2E_OB11_URL || `ws://127.0.0.1:${env.OB11_PORT || 3001}`;
-const AUDIT = resolve('logs/ingress.jsonl');
+const sha256 = (v) => createHash('sha256').update(v).digest('hex');
 
-const OWNER = { userId: Number(SELF_ID), chatId: Number(SELF_ID) };
-const OUTSIDER = { userId: 999999999, chatId: 999999999 };
+/** Synthetic principals. These ids exist in no policy and on no platform. */
+const SYNTHETIC = Object.freeze({ selfId: '900000000', ownerId: '900000001', outsiderId: '900000999' });
+const ISOLATED_ACK = 'e2e intake ok';
+
+function readLivePrincipals() {
+  const policy = JSON.parse(readFileSync(resolve('deploy/whitelist.json'), 'utf8'));
+  const owner = (policy.entries || []).find((e) => e.channel === 'onebot' && e.role === 'owner');
+  if (!owner) throw new Error('live mode needs a onebot owner entry in deploy/whitelist.json');
+  const selfId = String(env.SELF_ID || '');
+  if (!selfId) throw new Error('live mode needs SELF_ID in deploy/.env');
+  const tokenPath = 'deploy/secrets/napcat-ob11-access-token';
+  const token = existsSync(tokenPath) ? readFileSync(tokenPath, 'utf8').trim() : '';
+  if (!token) throw new Error('live mode needs deploy/secrets/napcat-ob11-access-token (or E2E_OB11_TOKEN)');
+  return { SELF_ID: selfId, TOKEN: token, FP: sha256(token), OWNER_ID: String(owner.userId), URL_BASE: process.env.E2E_OB11_URL || `ws://127.0.0.1:${env.OB11_PORT || 3001}`, AUDIT: resolve('logs/ingress.jsonl'), ACK_PATTERN: /收到|prototype intake|/, teardown: async () => {} };
+}
+
+async function bootIsolated() {
+  const dir = mkdtempSync(join(tmpdir(), 'ingress-e2e-'));
+  const token = randomBytes(24).toString('base64url');
+  // One shared signing secret for the SUB hop. A literal value is only accepted because
+  // NODE_ENV=test below; production refuses to resolve credentials from literals.
+  const hmac = randomBytes(24).toString('base64url');
+  writeFileSync(join(dir, 'whitelist.json'), JSON.stringify({
+    defaultRole: 'public',
+    entries: [{ channel: 'onebot', chatId: SYNTHETIC.ownerId, userId: SYNTHETIC.ownerId, role: 'owner', note: 'e2e synthetic owner' }],
+  }));
+  const auditPath = join(dir, 'ingress.jsonl');
+
+  const intake = new IntakeServer({
+    hmacSecret: hmac,
+    port: 0,
+    bind: '127.0.0.1',
+    audit: new AuditSink({ path: join(dir, 'intake.jsonl'), service: 'bot-core' }),
+    onMessage: async () => ({ reply: ISOLATED_ACK, queued: false }),
+  });
+  await intake.start();
+  const intakePort = intake.server.address().port;
+
+  const gw = await createGateway({
+    env: {
+      NODE_ENV: 'test',
+      AUDIT_SINK: auditPath,
+      WHITELIST_PATH: join(dir, 'whitelist.json'),
+      SUBMIT_HMAC_KEY_REF: hmac,
+      MEM_HMAC_SECRET_REF: hmac,
+      BOT_CORE_SUBMIT_URL: `http://127.0.0.1:${intakePort}/submit`,
+      OB11_PORT: '0',
+      OB11_BIND: '127.0.0.1',
+      OB11_ACCESS_TOKEN_FINGERPRINT: sha256(token),
+      OB11_EXPECTED_SELF_ID: SYNTHETIC.selfId,
+      GATEWAY_ADMIN_PORT: '0',
+      RATE_SENDER_PER_MIN: '10',
+      DEGRADED_FLAG_PATH: join(dir, 'degraded'),
+    },
+  });
+  const port = gw.ob11.server.address().port;
+  return {
+    SELF_ID: SYNTHETIC.selfId,
+    TOKEN: token,
+    FP: sha256(token),
+    OWNER_ID: SYNTHETIC.ownerId,
+    URL_BASE: `ws://127.0.0.1:${port}`,
+    AUDIT: auditPath,
+    ACK_PATTERN: new RegExp(ISOLATED_ACK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    teardown: async () => {
+      await gw.close();
+      await new Promise((r) => intake.server.close(r));
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+const TARGET = process.env.E2E_TARGET || (process.argv.includes('--live') ? 'live' : 'isolated');
+if (TARGET === 'live' && process.env.E2E_ALLOW_LIVE !== '1') {
+  console.error('refusing to inject test frames into the live gateway: this would answer a real person on QQ and add rows to the production audit. Set E2E_ALLOW_LIVE=1 to confirm.');
+  process.exit(2);
+}
+const CFG = TARGET === 'live' ? readLivePrincipals() : await bootIsolated();
+console.log(`target=${TARGET}  self_id=${CFG.SELF_ID}  audit=${CFG.AUDIT}`);
+
+const SELF_ID = CFG.SELF_ID;
+const TOKEN = CFG.TOKEN;
+const FP = CFG.FP;
+const URL_BASE = CFG.URL_BASE;
+const AUDIT = CFG.AUDIT;
+// The owner id is read from the policy (live) or the fixture (isolated), never hardcoded;
+// the outsider id is synthetic in both modes, so a live run cannot be authorised by it.
+const OWNER = { userId: Number(CFG.OWNER_ID), chatId: Number(CFG.OWNER_ID) };
+const OUTSIDER = { userId: Number(SYNTHETIC.outsiderId), chatId: Number(SYNTHETIC.outsiderId) };
 
 const results = [];
 const step = (name, ok, detail) => {
@@ -151,7 +241,7 @@ function connect({ token = TOKEN, answer = true } = {}) {
   ]);
   step('W3a the owner message reaches the agent plane and a reply comes back', Boolean(gotReply), JSON.stringify(gotReply || {}).slice(0, 160));
   const text = JSON.stringify(gotReply?.params?.message || '');
-  step('W3b the reply is the prototype acknowledgement', /收到|prototype intake/.test(text), text.slice(0, 120));
+  step('W3b the reply is the acknowledgement this target produces', CFG.ACK_PATTERN.test(text), text.slice(0, 120));
   const allowed = auditLines().slice(before).find((l) => l.type === 'authz.decision' && l.result === 'allowed' && l.role === 'owner');
   step('W3c the gate allowed it as role=owner', Boolean(allowed), JSON.stringify(allowed || {}).slice(0, 140));
   client.close();
