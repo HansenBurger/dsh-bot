@@ -70,6 +70,42 @@ docker compose -f deploy/compose.yaml logs -f napcat        # 看登录二维码
 白名单判决、审计、`send_private_msg` 到达真实 QQ；回复正文是固定 ack 文本。
 **不接 LLM**：`BOT_CORE_MODE` 保持 `echo`，模型链路是后续独立任务。
 
+## 2.5 本次 bring-up 的实测结论（21:37–21:45，容器已就绪等扫码）
+
+起栈踩到的两个坑与修法（详见 commit `ee994c2`）：
+
+1. **不能给 napcat 写 `user: "2100:2100"`**。上游 `entrypoint.sh` 自己降权
+   （`usermod` + `chown -R` + `gosu napcat`），且 `/app/NapCat.Shell.zip` 在镜像里是
+   `0600 root:root`：以 2100 启动连安装载荷都读不到，直接 crash-loop。
+2. **read-only rootfs 挡住解压**：`unzip -d ./NapCat.Shell` 需要可写目录 → 给它挂 tmpfs，
+   安装产物落 `data/napcat-app`。
+3. `cap_drop: [ALL]` 下的 root **没有 CAP_DAC_OVERRIDE**，也就是照样受普通文件权限约束：
+   安装目录必须让 uid 0 可写（`data/napcat-app`、`data/qq` 置 1777，
+   `data/napcat-config` 置 `a+rwX`），否则报 `cp: ... Permission denied`。
+   安装完 entrypoint 会把它们 chown 给应用用户。
+4. **镜像声明了 `VOLUME /app/napcat/config`**：不显式绑宿主目录时，每次重建都会换一个匿名卷，
+   反向 WS 的 url/token 就得重填。已显式绑 `data/napcat-config`。
+
+**已核对到的偏差（要如实记录）**：`NAPCAT_UID/NAPCAT_GID=2100` 没有生效。原因是
+`/etc` 在 read-only rootfs 下不可写，`usermod` 改不动 passwd 条目，于是
+`gosu napcat` 落在镜像内建的 **uid 1000**（容器内 `ps` 实测 `1000 napcat qq`）。
+这与 t3 基线里「协议容器以 2100 运行」不完全一致。当前缓解：容器只挂了
+`data/{qq,napcat-app,napcat-config,napcat-plugins}` 四个目录，宿主工作区与
+`deploy/secrets/*`（0600，uid 1000）**不在挂载里，容器读不到**；降权本身有效（不是 root）。
+彻底修法是自建派生镜像（预置 passwd 条目）并重新固定 digest，属后续任务，不在 t7 范围。
+
+反向 WS 已经预配好，不需要在 WebUI 手填：`MODE=reverse_ws` + `ONEBOT_URL` 让上游把
+`ws://172.28.0.10:3001/onebot/v11/ws` 写进了 `data/napcat-config/onebot11.json`
+（实测文件内容确认），我再把 `deploy/secrets/napcat-ob11-access-token` 的明文写进同一份配置的
+`token` 字段——**这是 t7 里唯一一次让明文 token 落到 NapCat 侧配置**，ingress 只持 sha256 指纹。
+登录完成后如果 NapCat 生成的是 `onebot11_<QQ号>.json`，需要确认该文件的 url/token 一致
+（登录后我实测并记录）。
+
+扫码就绪信号：容器 `Up`、WebUI `http://127.0.0.1:3081/webui?token=<NAPCAT_WEBUI_TOKEN>` 返回 200，
+日志停在 `[Core] [Login] 登录服务已断开，将允许重新获取二维码`。
+**注意：NapCat 会把 WebUI token 明文打进容器日志**（上游行为，无法在不改镜像的前提下关闭），
+所以 `docker compose logs napcat` 属于敏感输出。
+
 ## 3. 打通判定（白名单 + 非白名单 + 记忆）
 
 `deploy/whitelist.json` 里先准备好小号与一个陌生人 id：
