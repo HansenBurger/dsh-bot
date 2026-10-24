@@ -39,6 +39,11 @@ export const AUDIT_TYPES = Object.freeze([
   // instead of the information being lost.
   'ratelimit.exceeded',
   'session.lifecycle',
+  // Added with the t8 model path. `emit()` relabels anything outside this list, so the
+  // LLM egress calls and the companion turns would otherwise be indistinguishable from
+  // generic message events — and quota/latency forensics depend on grepping them out.
+  'llm.call',
+  'agent.turn',
 ]);
 
 const MAX_PREVIEW_CHARS = 200;
