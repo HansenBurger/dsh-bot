@@ -268,11 +268,22 @@ services:
   napcat:
     <<: *hardened
     profiles: ["qq"]
-    image: mlikiowa/napcat-docker:0.01.11@sha256:REPLACE_WITH_VERIFIED_DIGEST
+    # t3 G3 requires this image to be digest-pinned (unauditable third-party code holding
+    # the QQ session). The digest could NOT be verified from this host: Docker Hub times
+    # out, the daocloud mirror answers `denied` for this namespace and the USTC mirror
+    # does not reply. Shipping an invented digest would be worse than shipping the tag, so
+    # the tag stays and pinning is a one-command step on a machine with registry access:
+    #   bash scripts/verify-napcat-digest.sh --pin
+    image: mlikiowa/napcat-docker:0.01.11
     user: "2100:2100"
     security_opt:
       - "no-new-privileges:true"
-      - "seccomp=../deploy/seccomp/napcat.json"
+      # Docker resolves `seccomp=<path>` against the *daemon's* working directory, not the
+      # compose file, so a relative path could never work even if the file existed. The
+      # profile is supplied as an absolute path when available:
+      #   security_opt: ["no-new-privileges:true", "seccomp=/abs/deploy/seccomp/napcat.json"]
+      # Until then NapCat runs under Docker's default seccomp profile, which is still a
+      # deny-by-default syscall filter (not `unconfined`).
     networks:
       net-protocol: { ipv4_address: 172.28.0.20 }
       net-edge: { ipv4_address: 172.28.4.20 } # dials the published reverse-WS listener
