@@ -48,19 +48,27 @@ p.write_text(s)
 PY
 
 # 2) 反向 WS 的目标与令牌指纹必须与 ingress 一致
-#    deploy/.env: SELF_ID=<小号 QQ 号>
+#    deploy/.env: SELF_ID=<小号 QQ 号>（扫码登录后从 heartbeat/lifecycle 读出来回填）
 #    deploy/.env: TOKEN_FP=<sha256(access_token)>，access_token 本身不进 env
+#    已就位：deploy/secrets/napcat-ob11-access-token（0600，gitignored）= 新生成的 43 字符
+#    强随机 token；deploy/.env 的 TOKEN_FP 已换成它的 sha256（原型占位指纹作废）。
+#    取回明文：cat deploy/secrets/napcat-ob11-access-token   （只填进 NapCat 配置）
 docker compose -f deploy/compose.yaml up -d --wait          # 先起核心四件
 docker compose -f deploy/compose.yaml --profile qq up -d    # 再拉 NapCat
 docker compose -f deploy/compose.yaml logs -f napcat        # 看登录二维码/URL
 ```
 
-登录：打开 `http://127.0.0.1:3081/webui`（首次需要 `WEBUI_TOKEN` 里那个令牌），用小号扫码。
+登录：打开 `http://127.0.0.1:3081/webui`（口令 = `deploy/.env` 里的 `NAPCAT_WEBUI_TOKEN`），用小号扫码。
 **这一步需要人工，agent 会在此停住并报告，不空转重试。**
 
 在 WebUI 里确认 OneBot 网络设置为反向 WebSocket：
 `ws://172.28.0.10:3001/onebot/v11/ws`（compose 的 `MODE/ONEBOT_URL` 只初始化缺失配置，
-已有配置以 WebUI 为准），并设置 `access_token`（其 sha256 就是 `TOKEN_FP`）。
+已有配置以 WebUI 为准），`access_token` 填上面那个文件里的明文。改完 token 需要
+`docker compose restart ingress`（指纹在启动时读入 env）。
+
+**验收口径（captain 21:12 确认）**：t7 = echo 模式下的真实传输链——真 QQ 消息进出、
+白名单判决、审计、`send_private_msg` 到达真实 QQ；回复正文是固定 ack 文本。
+**不接 LLM**：`BOT_CORE_MODE` 保持 `echo`，模型链路是后续独立任务。
 
 ## 3. 打通判定（白名单 + 非白名单 + 记忆）
 
