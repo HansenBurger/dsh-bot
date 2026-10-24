@@ -300,11 +300,16 @@ services:
     ports:
       # C1/C-16: loopback only (3081 avoids the host's 3080). This was briefly published on
       # 0.0.0.0:3081 so a remote operator could reach the WebUI for the one-time QR login;
-      # reverted as soon as the login was adopted. The window is recorded in
-      # docs/validation/qq-channel-runbook.md rather than left dangling in the manifest.
+      # reverted right after the login was adopted. The window is recorded in
+      # docs/validation/qq-channel-runbook.md, not left dangling in the manifest.
       - "127.0.0.1:3081:6099"
     environment:
       MODE: reverse_ws # D-03: the protocol side dials us; the NAS listens to nothing new
+      # Without ACCOUNT the image starts QQ with no target account and always shows a fresh
+      # login QR, so a container recreate would silently cost us the session. entrypoint.sh
+      # passes `-q $ACCOUNT` when it is set, which is what makes the persisted credentials in
+      # ../data/qq usable. It follows SELF_ID so adoption does not need a second edit.
+      ACCOUNT: ${SELF_ID:?SELF_ID required (the bot's own QQ number)}
       ONEBOT_URL: ws://172.28.0.10:3001/onebot/v11/ws
       NAPCAT_UID: "1000"
       NAPCAT_GID: "1000"
