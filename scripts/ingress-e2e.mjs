@@ -32,7 +32,14 @@ if (existsSync(ENV_PATH)) {
   }
 }
 const SELF_ID = String(env.SELF_ID || '100012345');
-const TOKEN = process.env.E2E_OB11_TOKEN || 'prototype-token-for-local-verification';
+// Prefer the real credential the stack is pinning (deploy/secrets/napcat-ob11-access-token,
+// gitignored, 0600); fall back to the prototype string only for throwaway local runs. The
+// fingerprint in deploy/.env decides which of the two the gateway will accept.
+const TOKEN =
+  process.env.E2E_OB11_TOKEN ||
+  (existsSync('deploy/secrets/napcat-ob11-access-token')
+    ? readFileSync('deploy/secrets/napcat-ob11-access-token', 'utf8').trim()
+    : 'prototype-token-for-local-verification');
 const FP = createHash('sha256').update(TOKEN).digest('hex');
 const URL_BASE = process.env.E2E_OB11_URL || `ws://127.0.0.1:${env.OB11_PORT || 3001}`;
 const AUDIT = resolve('logs/ingress.jsonl');
