@@ -1,0 +1,13 @@
+{
+  "name": "dsh-big-fish-bot-docs",
+  "private": true,
+  "type": "module",
+  "description": "Design docs for the DSH big-fish chat companion; dev tooling is used only to verify Mermaid diagrams.",
+  "scripts": {
+    "check:mermaid": "node scripts/check-mermaid.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^26.0.0",
+    "mermaid": "^11.17.2"
+  }
+}

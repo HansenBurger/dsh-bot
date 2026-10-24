@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+.credentials.yaml
+*.key
+*.pem
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Testing & coverage
+coverage/
+.nyc_output/
+*.log
+
+# Docker runtime
+.docker-compose-tmp/
+volumes/
+
+# AgentTeams internal state (never version control team runtime)
+.agent-teams/*/state/
+.agent-teams/*/mailbox/
+.agent-teams/*/attempts/
+
+# Temporary files
+tmp/
+*.swp
+*.swo
+*~
