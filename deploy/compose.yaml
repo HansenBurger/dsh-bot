@@ -295,8 +295,8 @@ services:
       # Until then NapCat runs under Docker's default seccomp profile, which is still a
       # deny-by-default syscall filter (not `unconfined`).
     networks:
+      net-qq: {} # DEV-01: first entry -> carries the container's default route (masqueraded)
       net-protocol: { ipv4_address: 172.28.0.20 }
-      net-edge: { ipv4_address: 172.28.4.20 } # dials the published reverse-WS listener
     ports:
       # TEMPORARY (QQ bring-up): the operator administers this VM remotely from another
       # device, so the WebUI must be reachable on the LAN just for the QR login step.
@@ -305,8 +305,8 @@ services:
     environment:
       MODE: reverse_ws # D-03: the protocol side dials us; the NAS listens to nothing new
       ONEBOT_URL: ws://172.28.0.10:3001/onebot/v11/ws
-      NAPCAT_UID: "2100"
-      NAPCAT_GID: "2100"
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
       # Interpolated lazily (no `:?`) so `compose config` stays green while this profile
       # is off; the README requires a >=32-byte random value before the profile is used.
       WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:-}
@@ -398,3 +398,11 @@ networks:
     name: bot-net-ops
     internal: true
     ipam: { config: [{ subnet: 172.28.3.0/24 }] }
+  # DEV-01: the QQ protocol client is the one component that *must* reach the public
+  # internet (Tencent login/msf servers speak raw TCP/QUIC, which squid cannot CONNECT).
+  # It gets its own masqueraded bridge; no other service joins it, and the container still
+  # holds no secrets and cannot see the workspace (isolation stays container-level).
+  net-qq:
+    name: bot-net-qq
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "true"
