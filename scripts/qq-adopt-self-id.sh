@@ -30,19 +30,22 @@ for f in data/napcat-config/onebot11_*.json; do
   [[ "$id" =~ ^[0-9]{5,20}$ ]] && found+=("$id (from $f)")
 done
 
-# Source 2: mismatch audit lines, but only those from the NapCat container itself.
+# Source 2: the newest mismatch the gateway recorded, used only to *corroborate* source 1.
+# The self-id audit line carries no socketId (the socket sits on the adjacent lifecycle line),
+# so filtering by the NapCat address can never match it; and without corroboration the e2e
+# harness's deliberately foreign 555555555 is indistinguishable from a real login. Agreement
+# is required, disagreement fails closed.
 if [[ -f logs/ingress.jsonl ]]; then
-  AUDIT_ID=$(grep '"reason":"self-id-mismatch"' logs/ingress.jsonl 2>/dev/null \
-    | grep -F "\"socketId\":\"${NAPCAT_IP}:" | tail -1 \
+  AUDIT_ID=$(grep '"reason":"self-id-mismatch"' logs/ingress.jsonl 2>/dev/null | tail -1 \
     | grep -o '"observed":"[0-9]\{5,20\}"' | grep -o '[0-9]\+' || true)
-  [[ -n "${AUDIT_ID:-}" ]] && found+=("$AUDIT_ID (from audit, socket ${NAPCAT_IP})")
+  [[ -n "${AUDIT_ID:-}" ]] && found+=("$AUDIT_ID (from newest self-id-mismatch audit line)")
 fi
 
 if [[ ${#found[@]} -eq 0 ]]; then
   cat >&2 <<EOF
 No logged-in QQ account found yet.
   - no data/napcat-config/onebot11_<qq>.json   (NapCat writes it after a successful login)
-  - no self-id-mismatch audit line from ${NAPCAT_IP}
+  - no self-id-mismatch audit line
 Has the small account scanned the QR? Nothing was modified.
 EOF
   exit 1
@@ -92,6 +95,10 @@ print(f'deploy/whitelist.json: onebot owner = {owner}, prototype onebot entries 
 PY
 
 echo
-echo "Restarting the containers that read SELF_ID ..."
-timeout 180 docker compose -f deploy/compose.yaml restart ingress bot-core
+echo "Recreating the containers that read SELF_ID ..."
+# `restart` is not enough and silently keeps the old value: the container env is fixed at
+# creation, so editing deploy/.env only lands with `up -d`, which recreates on a config
+# change. Verified live - after `restart` the gateway still closed the real account with
+# self-id-mismatch, and only `up -d` made OB11_EXPECTED_SELF_ID read 207346792.
+timeout 200 docker compose -f deploy/compose.yaml up -d ingress bot-core
 echo "Now confirm the socket is accepted: the newest audit line should be event=connected with no self-id-mismatch."
