@@ -298,10 +298,11 @@ services:
       net-qq: {} # DEV-01: first entry -> carries the container's default route (masqueraded)
       net-protocol: { ipv4_address: 172.28.0.20 }
     ports:
-      # TEMPORARY (QQ bring-up): the operator administers this VM remotely from another
-      # device, so the WebUI must be reachable on the LAN just for the QR login step.
-      # Revert to 127.0.0.1 (C1/C-16) immediately after the QQ login is adopted.
-      - "0.0.0.0:3081:6099" # was: 127.0.0.1:3081:6099 (loopback only, avoids host's 3080)
+      # C1/C-16: loopback only (3081 avoids the host's 3080). This was briefly published on
+      # 0.0.0.0:3081 so a remote operator could reach the WebUI for the one-time QR login;
+      # reverted as soon as the login was adopted. The window is recorded in
+      # docs/validation/qq-channel-runbook.md rather than left dangling in the manifest.
+      - "127.0.0.1:3081:6099"
     environment:
       MODE: reverse_ws # D-03: the protocol side dials us; the NAS listens to nothing new
       ONEBOT_URL: ws://172.28.0.10:3001/onebot/v11/ws
