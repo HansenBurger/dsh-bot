@@ -145,4 +145,12 @@ scripts/               集成与端到端验证脚本
   与 Hub tag API 双源一致，见 [runbook 第 1 节](docs/validation/qq-channel-runbook.md)）；
   `deploy/seccomp/napcat.json` 仍是占位，因此 NapCat 目前跑在 Docker 默认 seccomp profile 下，
   需要自定义策略时用绝对路径 `NAPCAT_SECCOMP_PROFILE=/abs/napcat.json`（相对路径对 daemon 无效）。
+* **NapCat 容器实际以 uid 1000 运行，不是基线里的 2100**：镜像的 `entrypoint.sh` 靠
+  `usermod` 改 `/etc/passwd` 来落地 `NAPCAT_UID`，而 `read_only: true` 让 `/etc` 不可写，
+  于是 `gosu napcat` 落到镜像内建 uid 1000（容器内 `ps` 实测）。降权仍然生效（不是 root），
+  且容器只挂 `data/{qq,napcat-app,napcat-config,napcat-plugins}` 四个目录，宿主工作区与
+  `deploy/secrets/*` 不在其中。彻底修法需要自建派生镜像预置 passwd 再重新固化 digest，
+  待 t3 安全定级后另开任务。
+* **NapCat 会把 WebUI token 明文写进容器日志**（上游行为，不改镜像无法关闭），因此
+  `docker compose logs napcat` 属敏感输出；t3 时再评估是否要做日志脱敏。
 * `--profile ops` 的 watcher/collector 目前是最小实现，只做降级旗标与心跳读取。
