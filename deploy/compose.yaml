@@ -268,13 +268,14 @@ services:
   napcat:
     <<: *hardened
     profiles: ["qq"]
-    # t3 G3 requires this image to be digest-pinned (unauditable third-party code holding
-    # the QQ session). The digest could NOT be verified from this host: Docker Hub times
-    # out, the daocloud mirror answers `denied` for this namespace and the USTC mirror
-    # does not reply. Shipping an invented digest would be worse than shipping the tag, so
-    # the tag stays and pinning is a one-command step on a machine with registry access:
-    #   bash scripts/verify-napcat-digest.sh --pin
-    image: mlikiowa/napcat-docker:0.01.11
+    # t3 G3: digest-pinned (unauditable third-party code holding the QQ session).
+    # Resolved 2026-10-24 from this host after the router-level proxy was enabled and
+    # cross-verified by two independent sources returning the identical digest:
+    #   docker buildx imagetools inspect (registry manifest list, OCI index)
+    #   hub.docker.com/v2 tag API (amd64+arm64, last pushed 2026-10-21)
+    # The former placeholder tag `0.01.11` does NOT exist in the repository; the real
+    # current tag is v4.18.41 (matches NapCat v4.18.41 from the t1 research).
+    image: mlikiowa/napcat-docker:v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e
     user: "2100:2100"
     security_opt:
       - "no-new-privileges:true"
