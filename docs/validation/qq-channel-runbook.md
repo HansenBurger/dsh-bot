@@ -10,30 +10,30 @@ bot-core → DSH 生成回复 → 发回 QQ**，并要求同时观测“非白�
 | 编排/网络/env 契约 | ✅ 与上游文档核对一致 | `MODE=reverse_ws` + `ONEBOT_URL`、`WEBUI_TOKEN`、`NAPCAT_UID/GID`、三个挂载目录（`/app/.config/QQ`、`/app/napcat/config`、`/app/napcat/plugins`）均与 `NapNeko/NapCat-Docker` README 一致；WebUI 容器端口 6099 → 宿主 `127.0.0.1:3081` |
 | ingress 反向 WS 监听 | ✅ 已实测 | `127.0.0.1:3001` 已发布；`node scripts/ingress-e2e.mjs` 13/13（假适配器扮 NapCat，含 token 指纹、self_id 钉死、白名单拒绝、限流、审计无凭据） |
 | 数据目录权限 | ✅ | `data/{qq,napcat-config,napcat-plugins}` 已建并 `chown 2100:2100`（上游明确要求挂载目录对运行用户可读写） |
-| **镜像 digest 核验** | ❌ **本机不可达** | `docker manifest inspect` 连 `registry-1.docker.io` 超时；daocloud 镜像站对该命名空间回 `denied`；USTC 镜像站无响应；直连 `docker pull mlikiowa/napcat-docker:0.01.11` 亦超时 |
-| **NapCat 启动 + 扫码登录** | ⏸ 等用户 | 需要 (a) 能拉镜像的网络，(b) 用户用小号扫码 |
+| 镜像 digest 核验与固化 | ✅ 已完成（双源一致） | `v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e`，由 `docker buildx imagetools inspect` 与 Hub tag API 交叉核验一致，已写入 `deploy/compose.yaml`（commit `7c80935`）。**t3 G3 的 digest 门禁至此才算满足。** |
+| **NapCat 启动 + 扫码登录** | ⏸ 等用户扫码 | 镜像拉取在宿主后台进行中；拉到位后按第 2 节 bring-up，停在扫码处等人工 |
 
-未伪造任何 digest：`deploy/compose.yaml` 里 NapCat 仍是 `mlikiowa/napcat-docker:0.01.11`，
-并在注释里写明核验命令与原因。**t3 G3 的 digest 门禁在 --pin 之后才算满足。**
+第 1 步失败的真实根因不是网络，而是**任务书里那个 tag 不存在**：`mlikiowa/napcat-docker`
+没有 `0.01.11` 这个 tag（此前所有 `not found`/超时都掩盖了这一点），当前真实 tag 是
+`v4.18.41`（2026-10-21 推送，amd64+arm64）。路由器级代理开启后 registry 可达，digest
+按两条独立来源核验后固化——没有编造任何 hex 串。
 
-## 1. 用户/运维侧一条命令核验并固化 digest
-
-在能访问 Docker Hub 的机器上：
+## 1. digest 复核（升级或改 compose 后跑一次）
 
 ```bash
-bash scripts/verify-napcat-digest.sh            # 只打印
+bash scripts/verify-napcat-digest.sh            # 打印 tag 背后的 digest
 bash scripts/verify-napcat-digest.sh --pin      # 打印并写回 deploy/compose.yaml
 ```
 
-等价的手工命令（任选其一）：
+等价手工命令（任选其一，默认 tag 已是 `v4.18.41`）：
 
 ```bash
-docker buildx imagetools inspect mlikiowa/napcat-docker:0.01.11   # 看 Digest: sha256:…
-crane digest mlikiowa/napcat-docker:0.01.11
-skopeo inspect --format '{{.Digest}}' docker://mlikiowa/napcat-docker:0.01.11
+docker buildx imagetools inspect mlikiowa/napcat-docker:v4.18.41   # 看 Digest: sha256:…
+crane digest mlikiowa/napcat-docker:v4.18.41
+skopeo inspect --format '{{.Digest}}' docker://mlikiowa/napcat-docker:v4.18.41
 ```
 
-拿到后 compose 应长成：`image: mlikiowa/napcat-docker:0.01.11@sha256:<64hex>`。
+compose 里的形态：`image: mlikiowa/napcat-docker:v4.18.41@sha256:b101b896…`。
 
 ## 2. 启动 NapCat 并登录小号
 

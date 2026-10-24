@@ -141,5 +141,8 @@ scripts/               集成与端到端验证脚本
   验收；默认栈不挂 TG 入站，`deploy/.env` 的 `TG_BOT_TOKEN_ALERT` 只服务可选的告警看门狗。
   打通顺序 QQ 优先。
 * Telegram 侧只实现了出站 + getUpdates 长轮询，没有入站监听器（C6）。
-* NapCat 镜像用 digest 固定占位；`deploy/seccomp/napcat.json` 是给 uid 2100 策略留的位。
+* NapCat 镜像按 digest 固化：`mlikiowa/napcat-docker:v4.18.41@sha256:b101b896…`（buildx imagetools
+  与 Hub tag API 双源一致，见 [runbook 第 1 节](docs/validation/qq-channel-runbook.md)）；
+  `deploy/seccomp/napcat.json` 仍是占位，因此 NapCat 目前跑在 Docker 默认 seccomp profile 下，
+  需要自定义策略时用绝对路径 `NAPCAT_SECCOMP_PROFILE=/abs/napcat.json`（相对路径对 daemon 无效）。
 * `--profile ops` 的 watcher/collector 目前是最小实现，只做降级旗标与心跳读取。
