@@ -94,6 +94,26 @@ docker compose -f deploy/compose.yaml exec -T memory sqlite3 /var/lib/dshbot/mem
 [记忆] memory-e2e 24/24；memory_access_log: write/read/search 记录齐全
 ```
 
+## 3.5 已实测的网络半程证据（容器内扮演适配器）
+
+从 `bot-net-protocol` 内的容器（NapCat 将来所在的网络位置）拨 ingress 的真实地址，
+而不是宿主 loopback：
+
+```bash
+timeout 240 docker run --rm --network bot-net-protocol -v $PWD:/host:ro -w /host \
+  -e E2E_OB11_URL=ws://172.28.0.10:3001 docker.m.daocloud.io/library/node:22-slim \
+  node --no-warnings scripts/ingress-e2e.mjs
+```
+
+实测 **13/13 通过**（20:48 左右）：错误 access_token → 关闭码 1008 + `token-fingerprint-mismatch`
+审计；伪 `self_id` → 1008；非白名单 `user_id=999999999` → 0 次上游调用 +
+`reason=not-whitelisted` 审计 + 不落昵称；owner 私信 → `send_private_msg` 回程帧；
+文本里自称主人不改变判决；连发 14 条触发 `ratelimit.exceeded`；审计文件无凭据。
+
+**这条证据的边界要诚实说明**：扮演 NapCat 的仍是脚本，不是真 QQ 账号。它证明
+“反向 WS 通路 + 白名单判决 + 回程动作”在真实网络位置上可用，不证明腾讯侧的
+登录/风控/消息格式细节——那需要第 2 节的人工扫码。
+
 ## 4. Telegram：明确 deferred（不在本任务范围）
 
 `api.telegram.org` 从本机不可达（调研期已证实），因此 TG 通道整体标记 deferred：
