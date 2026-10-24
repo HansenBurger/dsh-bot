@@ -135,6 +135,11 @@ scripts/               集成与端到端验证脚本
 ## 已知限制（原型阶段）
 
 * 没有真实 QQ 号时，回复链路只能由 `scripts/ingress-e2e.mjs` 扮演的假适配器闭环。
+* **Telegram 通道整体 deferred（本原型不启用）**：本机到 `api.telegram.org` 网络不可达
+  （调研期已证实，也是此前“卡住”的根因）。适配器代码与出站/长轮询实现保留，单测对着本地
+  假 API 跑通（`apps/gateway/test/telegram.test.mjs`，11 项，全程不联网），但没有真实 TG
+  验收；默认栈不挂 TG 入站，`deploy/.env` 的 `TG_BOT_TOKEN_ALERT` 只服务可选的告警看门狗。
+  打通顺序 QQ 优先。
 * Telegram 侧只实现了出站 + getUpdates 长轮询，没有入站监听器（C6）。
 * NapCat 镜像用 digest 固定占位；`deploy/seccomp/napcat.json` 是给 uid 2100 策略留的位。
 * `--profile ops` 的 watcher/collector 目前是最小实现，只做降级旗标与心跳读取。

@@ -49,8 +49,17 @@ export class TelegramAdapter {
   async #loop() {
     while (this.running) {
       try {
-        const updates = await this.getUpdates();
+        // The Bot API answers with an envelope: {ok, result}. Iterating it directly is a
+        // TypeError ("updates is not iterable") that the catch below turns into a silent
+        // error+backoff — inbound Telegram polling would never deliver anything while the
+        // health endpoint stayed green.
+        const envelope = await this.getUpdates();
+        const updates = Array.isArray(envelope?.result) ? envelope.result : [];
         this.stats.polls += 1;
+        if (!Array.isArray(envelope?.result)) {
+          this.stats.errors += 1;
+          this.audit?.emit('sandbox.denied', { stage: 'tg-poll', result: 'error', message: 'unexpected getUpdates envelope' });
+        }
         for (const upd of updates) {
           this.offset = Math.max(this.offset, Number(upd.update_id) + 1);
           const msg = upd.message || upd.edited_message;
