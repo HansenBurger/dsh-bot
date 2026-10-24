@@ -1,0 +1,42 @@
+# Companion profile patch layer (t3 §4), applied after every bundle layer.
+# Verified against the installed @deepseek-ai/dsh 0.2.1-rc.2 plugin schemas —
+# an invented config key is a boot failure, so each key below was read from the
+# plugin's own `interface Config`.
+#
+# U2 — one filesystem policy home: read-only by default with a single disposable
+# workspace root. The agent's writable surface is /rw/work (a tmpfs volume), never a
+# NAS share (U2) and never the profile directory (the profile is mounted :ro).
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: read-only            # dsh-sandbox-policy Config.mode (fail-safe default)
+    workspaceRoot: /rw/work    # absolute; a relative value fails at load
+
+# U3/C-10 — exactly one permission entry point, and `danger-full-access` does not
+# exist in this table. `approval: ask` is the only mode; the approval answerer is the
+# owner's private chat, and with no answerer composed the service is fail-closed.
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      companion:
+        sandbox: read-only
+        approval: ask
+    defaultPreset: companion
+
+# C-10 — the deployment default for sessions without an `approval/policy` override.
+# 'ask' delegates to the composed answerers and fails closed when there are none,
+# which is the property the memory tools depend on: an unanswered approval never
+# writes to memory.
+- id: user-approval
+  name: '@deepseek-ai/dsh-user-approval'
+  config:
+    policy: ask
+
+# The companion extension: registers memory_read/search/write/forget, the monotonic
+# guard, and the memory-handling system-prompt section.
+- id: bot-core
+  name: '@dsh-bot/bot-core'
+  config:
+    memoryUrl: http://172.28.0.50:8091
+    searchLimit: 8

@@ -1,0 +1,27 @@
+{
+  "_comment": "A1 gate: default-deny on structured ids. Display names are not consulted anywhere in the pipeline, so a nickname match cannot authorize anyone. Owner rule: at most one owner entry per channel (two owners in one channel is a policy error); a different owner id on another channel loads but is flagged at boot for review. Roles are owner|trusted; new entries need a review (docs/security/t2-security-baseline.md A1/A3).",
+  "defaultRole": "public",
+  "entries": [
+    {
+      "channel": "onebot",
+      "chatId": "100012345",
+      "userId": "100012345",
+      "role": "owner",
+      "note": "主人私聊（DM 的 chat_id 等于其 QQ 号）"
+    },
+    {
+      "channel": "telegram",
+      "chatId": "777000000",
+      "userId": "777000000",
+      "role": "owner",
+      "note": "主人 TG 私聊，审批消息走这里"
+    },
+    {
+      "channel": "onebot",
+      "chatId": "987654321",
+      "userId": "100012345",
+      "role": "trusted",
+      "note": "群聊中的主人：可对话，不可删除记忆（guard 只放行 owner）"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-bot",
+  "private": true,
+  "description": "Companion profile: hard sandbox defaults + the bot-core memory extension.",
+  "dsh": {
+    "profile": {
+      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"]
+    }
+  },
+  "dependencies": {
+    "@dsh-bot/bot-core": "file:/app/apps/bot-core"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3"
+  }
+}
