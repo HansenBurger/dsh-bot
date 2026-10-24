@@ -83,17 +83,35 @@ export function decodePrincipal(encoded) {
   return obj;
 }
 
+const BIND_SEP = 'bind\n';
+
 /**
- * Canonical string-to-sign: method || path || bodySha256 || principal.
+ * Canonical string-to-sign: method || path || bodySha256 || principal [|| bindHash].
  * Hashing the body keeps the signed string bounded regardless of payload size.
  *
- * @param {{method:string, path:string, body:string|Buffer|undefined, principal:string}} input
+ * ⚠ `path` must be the **request target as it goes on the wire**, query string
+ * included. Dropping the query is not cosmetic: `POST /v1/memories/{id}/forget`
+ * carries its `dryRun` flag there, so a signature over the bare path would let an
+ * on-path attacker turn a signed *preview* into a signed *delete* without breaking
+ * the signature.
+ *
+ * `bind` is the optional third channel-binding (typically the value of
+ * `X-Bot-Approval`). Unbound headers are mutable by anyone who can see the request,
+ * and an approval token is exactly the field that must not be attachable after the
+ * fact: with the token inside the signature, "approval present" means "approval was
+ * granted before this request was built". Callers that do not bind produce byte-identical
+ * strings to the previous version, so this stays compatible.
+ *
+ * @param {{method:string, path:string, body:string|Buffer|undefined, principal:string, bind?:string}} input
  */
-export function canonicalString({ method, path, body, principal }) {
+export function canonicalString({ method, path, body, principal, bind }) {
   const bodyHash = createHmac('sha256', 'body-domain-separator')
     .update(body === undefined || body === null ? Buffer.alloc(0) : Buffer.from(body))
     .digest('hex');
-  return [String(method).toUpperCase(), String(path), bodyHash, String(principal ?? '')].join('\n');
+  const base = [String(method).toUpperCase(), String(path), bodyHash, String(principal ?? '')].join('\n');
+  if (typeof bind !== 'string' || bind.length === 0) return base;
+  const bindHash = createHmac('sha256', BIND_SEP).update(Buffer.from(bind)).digest('hex');
+  return `${base}\n${bindHash}`;
 }
 
 /**
@@ -172,7 +190,7 @@ export function verify(secret, req) {
   const now = req.now ?? Date.now();
   if (Math.abs(now - Number(principal.ts)) > TS_SKEW_MS) throw new HmacError('UNAUTHENTICATED', 'timestamp outside ±5s window');
 
-  const expected = sign(secret, { method: req.method, path: req.path, body: req.body, principal: encoded });
+  const expected = sign(secret, { method: req.method, path: req.path, body: req.body, principal: encoded, bind: req.bind });
   if (!safeEqual(expected, signature)) throw new HmacError('UNAUTHENTICATED', 'signature mismatch');
 
   if (req.nonces && req.nonces.seen(principal.nonce)) throw new HmacError('NONCE_REPLAY', 'nonce already used');
@@ -194,6 +212,10 @@ export function verify(secret, req) {
 export function signedHeaders(secret, parts) {
   const encoded =
     typeof parts.principal === 'string' ? parts.principal : encodePrincipal(parts);
-  const sig = sign(secret, { method: parts.method, path: parts.path, body: parts.body, principal: encoded });
-  return { 'X-Bot-Principal': encoded, 'X-Bot-Sig': sig };
+  const sig = sign(secret, { method: parts.method, path: parts.path, body: parts.body, principal: encoded, bind: parts.bind });
+  const headers = { 'X-Bot-Principal': encoded, 'X-Bot-Sig': sig };
+  // A bound header must be *sent*, otherwise the verifier recomputes a different
+  // string-to-sign; returning it here keeps bind/emit in one place.
+  if (typeof parts.bind === 'string' && parts.bind.length > 0) headers['X-Bot-Approval'] = parts.bind;
+  return headers;
 }

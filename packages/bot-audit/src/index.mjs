@@ -32,6 +32,13 @@ export const AUDIT_TYPES = Object.freeze([
   'egress.connect',
   'config.change',
   'memory.access',
+  // Added with the t5 runtime: `emit()` rewrites anything outside this list to
+  // `external.message`, and the gateway's rate-limit and connection events were being
+  // silently relabelled — an operator grepping for throttling found nothing. They are
+  // distinct event classes, not subtypes of "external message", so the vocabulary grows
+  // instead of the information being lost.
+  'ratelimit.exceeded',
+  'session.lifecycle',
 ]);
 
 const MAX_PREVIEW_CHARS = 200;

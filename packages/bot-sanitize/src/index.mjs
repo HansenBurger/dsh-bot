@@ -227,6 +227,13 @@ export function redactOutbound(text) {
  * @param {string} body
  * @returns {{refused: boolean, reason?: string}}
  */
+/**
+ * Prefix shapes issued by providers our users actually paste. Deliberately a
+ * *prefix* match (not anchored): credentials appear inside sentences
+ * ("我的 key 是 sk-xxxx").
+ */
+const PROVIDER_KEY_SHAPE = /\b(?:sk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{16,}|sk_[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|dckr_pat_[A-Za-z0-9_-]{16,})/;
+
 export function detectSecretClass(body) {
   if (typeof body !== 'string' || body.length === 0) return { refused: false };
   const labelled = /\b(?:password|passwd|pwd|secret|private[_-]?key|access[_-]?token|api[_-]?key)\s*[:=]\s*\S{6,}/i;
@@ -234,6 +241,10 @@ export function detectSecretClass(body) {
   // PEM/OpenSSH/jwt shapes
   if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(body)) return { refused: true, reason: 'pem-private-key' };
   if (/^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/.test(body.trim())) return { refused: true, reason: 'jwt-shaped-token' };
+  // Well-known provider key shapes. Entropy alone misses them: `sk-proj-…` is a
+  // 28-char credential that sits *below* the 32-char entropy threshold, so §5.1's
+  // "credentials are never stored" rule had a hole for exactly the most common class.
+  if (PROVIDER_KEY_SHAPE.test(body)) return { refused: true, reason: 'provider-key-shape' };
   // high-entropy run of >= 32 chars with no spaces
   const runs = body.match(/\S{32,}/g) || [];
   for (const run of runs) {

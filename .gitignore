@@ -49,3 +49,15 @@ secrets/
 *.db-shm
 .env.local
 pgdata-test/
+
+# Docker-created bind sources when a compose path was wrong (never commit)
+deploy/deploy/
+deploy/data/
+deploy/logs/
+deploy/state/
+
+# runtime state, audit logs and team scratch — never committed
+/logs/
+/data/
+/state/
+/.agent-teams/
