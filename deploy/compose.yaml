@@ -276,7 +276,16 @@ services:
     # The former placeholder tag `0.01.11` does NOT exist in the repository; the real
     # current tag is v4.18.41 (matches NapCat v4.18.41 from the t1 research).
     image: mlikiowa/napcat-docker:v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e
-    user: "2100:2100"
+    # t3's "NapCat runs as uid 2100" is honoured by the image itself, not by compose:
+    # entrypoint.sh does `usermod -o -u $NAPCAT_UID napcat` + `chown -R` + `gosu napcat`,
+    # so it has to start as root. Forcing `user: "2100:2100"` here made it crash-loop —
+    # /app/NapCat.Shell.zip is mode 0600 root:root, and uid 2100 cannot even read the
+    # payload it is supposed to install. The drop still happens; `docker top` shows the
+    # app processes owned by 2100, which is a stronger claim than a compose directive.
+    # The four capabilities below are the minimum for usermod/groupmod/chown/gosu; they
+    # are granted only to this protocol container, never to the agent or memory planes.
+    user: "0:0"
+    cap_add: [CHOWN, FOWNER, SETUID, SETGID]
     security_opt:
       - "no-new-privileges:true"
       # Docker resolves `seccomp=<path>` against the *daemon's* working directory, not the
@@ -298,8 +307,25 @@ services:
       # Interpolated lazily (no `:?`) so `compose config` stays green while this profile
       # is off; the README requires a >=32-byte random value before the profile is used.
       WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:-}
+    # The image installs itself by unzipping /app/NapCat.Shell.zip into ./NapCat.Shell on
+    # first start, which a read-only rootfs refuses ("cannot create extraction directory").
+    # The scratch directory is a tmpfs instead of loosening the rootfs: it is wiped with the
+    # container, and the installed tree lands in ../data/napcat-app below. Declaring `tmpfs`
+    # here replaces the anchor's list, so /tmp is repeated rather than inherited.
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/NapCat.Shell:size=256m,mode=1777
     volumes:
       - ../data/qq:/app/.config/QQ
+      # The install target: entrypoint.sh unzips the payload into /app/napcat, which a
+      # read-only rootfs would refuse. One host directory holds the installed app *and*
+      # its config, so the login token survives recreation (that is what keeps the QR
+      # scan a one-time step).
+      - ../data/napcat-app:/app/napcat
+      # The image declares VOLUME /app/napcat/config, so without an explicit bind every
+      # recreate gets a fresh anonymous volume and the reverse-WS settings (url +
+      # access_token) would have to be redone by hand. Binding the host directory keeps
+      # them; the self-install above writes the templates into it on first run.
       - ../data/napcat-config:/app/napcat/config
       - ../data/napcat-plugins:/app/napcat/plugins:ro
 
