@@ -439,3 +439,62 @@ test('end to end: a non-allowlisted egress site found in broker.jsonl degrades o
   await new Promise((r) => up.close(r));
   rmSync(d, { recursive: true, force: true });
 });
+
+/* ------------------------------------------- E7 divergence gate (post-merge hotfix) */
+
+test('E7: an idle stack is silent on every stream at once and that is not a finding', async () => {
+  const d = dir();
+  const logDir = join(d, 'logs');
+  const stateDir = join(d, 'state');
+  mkdirSync(logDir);
+  mkdirSync(stateDir, { recursive: true });
+  const port = await freePort();
+  const up = createServer((sock) => sock.end());
+  await new Promise((r) => up.listen(port, '127.0.0.1', r));
+  try {
+    writeFileSync(join(logDir, 'ingress.jsonl'), line({ type: 'authz.decision', service: 'gateway' }));
+    writeFileSync(join(logDir, 'agent.jsonl'), line({ type: 'agent.turn', service: 'bot-core' }));
+    const outbox = join(stateDir, 'alerts.jsonl');
+    const w = createWatcher({
+      env: {
+        WATCHER_LOG_DIR: logDir,
+        WATCHER_LOG_FILES: 'ingress.jsonl,agent.jsonl',
+        WATCHER_TARGETS: `memory=tcp://127.0.0.1:${port}:required`,
+        DEGRADED_FLAG_PATH: join(stateDir, 'degraded'),
+        WATCHER_ALERT_OUTBOX: outbox,
+        WATCHER_CURSOR_PATH: join(stateDir, 'cursor.json'),
+        WATCHER_HEARTBEAT_PATH: join(stateDir, 'heartbeat'),
+        WATCHER_STALE_LOG_MIN: '0.0005', // 30ms — the fake-clock ticks below are far apart
+      },
+    });
+    // E7 findings bypass tickOnce().findings and go straight to the dispatcher
+    // (index.mjs: checkGrowth → alerts.dispatch), so the dry-run ledger is the
+    // observable, not the returned findings array.
+    const e7s = () => {
+      try {
+        return readFileSync(outbox, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((a) => a.rule === 'E7-audit-silence');
+      } catch {
+        return [];
+      }
+    };
+
+    await w.tickOnce(1000); // baseline: sized but never grew
+    appendFileSync(join(logDir, 'ingress.jsonl'), line({ type: 'authz.decision', service: 'gateway' }));
+    appendFileSync(join(logDir, 'agent.jsonl'), line({ type: 'agent.turn', service: 'bot-core' }));
+    await w.tickOnce(2000); // both grow: everGrew=true, at=2000
+
+    await w.tickOnce(5000); // both silent 3000ms >> 30ms — a quiet evening
+    assert.deepEqual(e7s(), [], 'all streams silent together = idle companion, not a stalled writer');
+
+    appendFileSync(join(logDir, 'agent.jsonl'), line({ type: 'agent.turn', service: 'bot-core' }));
+    await w.tickOnce(6000); // agent moves; ingress stalled 4000ms
+    assert.equal(e7s().length, 1, 'a stream that stalls while a peer still moves = the real TM-014 signal');
+    assert.equal(e7s()[0].evidence.file, 'ingress.jsonl');
+
+    await w.tickOnce(7000); // ingress deduped until it grows again; agent aged out of the peer window
+    assert.equal(e7s().length, 1, 'one stall episode = one alert — no self-feeding hourly loop');
+  } finally {
+    await new Promise((r) => up.close(r));
+    rmSync(d, { recursive: true, force: true });
+  }
+});
