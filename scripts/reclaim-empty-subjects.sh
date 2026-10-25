@@ -71,9 +71,9 @@ trap 'rm -f "$script"' EXIT
   for row in "${shells[@]}"; do
     key="${row%%|*}"; id="$(echo "$row" | cut -d'|' -f2)"
     printf "DELETE FROM companion.subject s WHERE s.subject_id = '%s'::uuid AND %s %s;\n" "$id" "$EMPTY_WHERE" "$OWNER_FILTER"
-    printf "\\echo deleted  %s  (%s)\n" "$id" "$key"
   done
-  if [ "${ROLLBACK:-0}" = "1" ]; then echo 'ROLLBACK;'; echo "\echo ROLLBACK done: nothing changed"; else echo 'COMMIT;'; fi
+  if [ "${ROLLBACK:-0}" = "1" ]; then echo 'ROLLBACK;'; else echo 'COMMIT;'; fi
 } > "$script"
 PGPASSWORD="$(cat "$RW_PWD_FILE")" psql -h "$SOCKET_DIR" -U dsh_companion_rw -d "$DB" -X -q -v ON_ERROR_STOP=1 -f "$script"
-echo "done. 这条流不落 memory.access JSONL（脚本绕过了服务），操作记录留在本机 stdout。"
+if [ "${ROLLBACK:-0}" = "1" ]; then echo "演练完成：DELETE 全部执行成功后 ROLLBACK，零变更。"; else echo "已提交删除 ${#shells[@]} 个主体壳。"; fi
+echo "注意：这条流不落 memory.access JSONL（脚本绕过了服务），操作记录留在本机 stdout。"
