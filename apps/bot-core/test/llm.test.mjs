@@ -552,3 +552,105 @@ test('T9-F1: two writes in one message — approval is one-at-a-time, the tail i
   for (const seen of l.llm.seen) assertAnsweredToolCalls(seen.messages, 'F1 replay');
 });
 
+/* ---------------- T9-F5: a failed apply must not burn the approval ---------------- */
+
+function failingMemory() {
+  const writes = [];
+  let failNext = true;
+  return {
+    writes,
+    async search() { return { results: [], truncated: false }; },
+    async read() { return { memoryId: 'm', body: '', occurredAt: 1 }; },
+    async write(args, principal) {
+      writes.push({ args, principal });
+      if (failNext) {
+        failNext = false;
+        throw Object.assign(new Error('MEMORY_WRITE_FAILED simulated'), { code: 'MEMORY_WRITE_FAILED' });
+      }
+      return { memoryId: 'm-ok', deduped: false, conflict: false };
+    },
+    async forget() { return { deletedCount: 0, dryRun: true }; },
+    succeedNextWrite() { failNext = false; },
+  };
+}
+
+test('T9-F5: apply fails -> the pending is requeued and one more 同意 retries the SAME call', async () => {
+  const memory = failingMemory();
+  const script = [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'profile', body: '主人测试代号 F5', attrKey: 'code.f5' })];
+  const { loop: l, sink } = loop({ script, memory });
+  const first = await l.turn({ text: '记住我的测试代号 F5', principal: OWNER });
+  assert.equal(first.pending, true);
+
+  const bad = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(bad.error, 'MEMORY_WRITE_FAILED simulated');
+  assert.match(bad.reply, /写入失败/);
+  assert.match(bad.reply, /再回「同意」重试/);
+  assert.equal(bad.requeued, true);
+  assert.equal(l.approvals.byChat.size, 1, 'the decision survives its failed execution');
+  assert.equal(memory.writes.length, 1);
+
+  // retry: zero model calls, a fresh one-time token, the SAME stored arguments.
+  const retry = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(retry.applied, true);
+  assert.equal(retry.calls, 0);
+  assert.equal(memory.writes.length, 2);
+  assert.deepEqual(memory.writes[1].args.body, memory.writes[0].args.body);
+  assert.equal(l.approvals.byChat.size, 0);
+
+  const log = readFileSync(sink.path, 'utf8');
+  assert.match(log, /"stage":"requeued"/);
+  assert.match(log, /"stage":"applied","result":"error"/);
+  assert.equal((log.match(/"stage":"applied","result":"allowed"/g) || []).length, 1, 'exactly one durable success entered the ledger');
+  const hist = l.history.get(l.historyKey(OWNER));
+  assert.match(hist.find((m) => m.role === 'tool' && m.tool_call_id === 'c1').content, /已经执行/, 'the history settles with the eventual truth');
+});
+
+test('T9-F5: 拒绝 after a failed apply clears the requeued pending and writes nothing further', async () => {
+  const memory = failingMemory();
+  const script = [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'profile', body: '主人测试代号 F5b', attrKey: 'code.f5b' })];
+  const { loop: l } = loop({ script, memory });
+  await l.turn({ text: '记住我的测试代号 F5b', principal: OWNER });
+  const bad = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(bad.requeued, true);
+  const dropped = await l.resolvePending({ text: '拒绝', principal: OWNER });
+  assert.equal(dropped.denied, true);
+  assert.equal(l.approvals.byChat.size, 0);
+  assert.equal(memory.writes.length, 1, 'the failed attempt is the only one');
+  // and a late 同意 now hits the orphan path — never a silent write.
+  const late = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(late.orphan, true);
+});
+
+test('T9-F5: restore refuses to clobber a newer pending and expires with the window', () => {
+  let now = 10_000;
+  const sink = audit();
+  const q = new ApprovalQueue({ ttlMs: 50_000, audit: sink, now: () => now });
+  const p = q.create({ principal: OWNER, toolName: 'memory_write', args: {}, note: 'n' });
+  assert.ok(p);
+  q.take(q.key(OWNER), 'approved');
+  assert.equal(q.restore(p, q.key(OWNER)), true, 'a free slot takes the retry back');
+  // a second create while the restored one lives must coalesce (one pending per chat).
+  assert.equal(q.create({ principal: OWNER, toolName: 'memory_write', args: {}, note: 'n2' }), null);
+  // expired pendings are not resurrected.
+  now += 60_000;
+  q.byChat.delete(q.key(OWNER));
+  assert.equal(q.restore(p, q.key(OWNER)), false);
+});
+
+test('T9-F5: a requeued pending that expires settles the history without claiming "主人没有回复"', async () => {
+  let now = 10_000;
+  const memory = failingMemory();
+  const sink = audit();
+  const approvals = new ApprovalQueue({ ttlMs: 50_000, audit: sink, now: () => now });
+  const script = [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'profile', body: '主人测试代号 F5c', attrKey: 'code.f5c' })];
+  const { loop: l } = loop({ script, memory, approvals });
+  await l.turn({ text: '记住测试代号 F5c', principal: OWNER });
+  const bad = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(bad.requeued, true);
+  now += 60_000;
+  const late = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(late.orphan, true, 'the retry window closed: the word approves nothing');
+  const toolMsg = l.history.get(l.historyKey(OWNER)).find((m) => m.role === 'tool' && m.tool_call_id === 'c1');
+  assert.match(toolMsg.content, /上次执行失败/);
+  assert.doesNotMatch(toolMsg.content, /主人没有回复/);
+});

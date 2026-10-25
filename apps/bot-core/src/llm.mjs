@@ -160,6 +160,23 @@ export class ApprovalQueue {
     return pending;
   }
 
+  /**
+   * T9-F5: the apply *failed after* the owner approved. The human decision is still the
+   * one that was made — same principal, same stored arguments, same conversation — so the
+   * pending goes back into the slot and one more "同意" can retry it. Fail-closed is
+   * untouched: nothing was written, the minted token never left this process, and if the
+   * restore is refused (slot taken, window closed) the retry word lands on the orphan
+   * path, which writes nothing either.
+   */
+  restore(pending, key) {
+    if (!pending) return false;
+    const slot = key || this.key(pending.principal);
+    if (this.now() > pending.expiresAt) return false; // the confirmation window really closed
+    if (this.byChat.has(slot)) return false; // a newer pending owns this chat's slot
+    this.byChat.set(slot, pending);
+    this.audit.emit('approval.outcome', { stage: 'requeued', approvalId: pending.id, toolName: pending.toolName, chatKey: slot, reason: 'apply-failed', retryableUntil: pending.expiresAt });
+    return true;
+  }
 }
 
 /**
@@ -272,6 +289,13 @@ export class CompanionLoop {
     if (!this.approvals.onExpire) {
       this.approvals.onExpire = (pending) => {
         if (!pending || !pending.callId) return;
+        // T9-F5: a requeued pending *was* answered — the owner said 同意 and the apply
+        // failed. Saying "主人没有回复" about that would be a lie that survives the
+        // window; the honest text is "the retry window closed with nothing written".
+        if (pending.requeued) {
+          this.settlePendingCall(pending.historyKey, pending.callId, `上次执行失败，确认窗口已关闭，这条没有写入；需要的话再说一声我重新提。`);
+          return;
+        }
         this.settlePendingCall(pending.historyKey, pending.callId, `主人没有回复，确认窗口（${Math.round((this.approvals.ttlMs ?? 300_000) / 60_000)} 分钟）已超时，这一步没有执行。`);
       };
     }
@@ -476,9 +500,24 @@ export class CompanionLoop {
       this.audit.emit('approval.outcome', { stage: 'applied', result: 'allowed', approvalId: pending.id, toolName: pending.toolName, chatKey: key, memoryId: out?.memoryId ?? null, deduped: Boolean(out?.deduped) });
       return { reply: text, calls: 0, applied: true, memoryId: out?.memoryId ?? null };
     } catch (err) {
-      this.settlePendingCall(pending.historyKey, pending.callId, `主人已同意，但这一步执行失败：${shortReason(err)}。没有写入。`);
-      this.audit.emit('approval.outcome', { stage: 'applied', result: 'error', approvalId: pending.id, toolName: pending.toolName, chatKey: key, reason: String(err.message).slice(0, 160) });
-      return { reply: `写入失败了：${shortReason(err)}。`, calls: 0, error: err.message };
+      // T9-F5: a failed apply is *not* a burned approval. Put the pending back so one
+      // more "同意" retries the exact same stored call (a fresh one-time token is minted
+      // then); with the slot gone or the window closed this degrades to the old
+      // consume-once behaviour, which also wrote nothing.
+      const requeued = this.approvals.restore(pending, key);
+      if (requeued) pending.requeued = true;
+      this.settlePendingCall(pending.historyKey, pending.callId, requeued
+        ? `主人已同意，但这一步执行失败：${shortReason(err)}。没有写入；这条还在等你确认，可以再回「同意」重试。`
+        : `主人已同意，但这一步执行失败：${shortReason(err)}。没有写入。`);
+      this.audit.emit('approval.outcome', { stage: 'applied', result: 'error', approvalId: pending.id, toolName: pending.toolName, chatKey: key, reason: String(err.message).slice(0, 160), requeued });
+      return {
+        reply: requeued
+          ? `写入失败了：${shortReason(err)}。这条还等你确认，可以再回「同意」重试（或「拒绝」放弃）。`
+          : `写入失败了：${shortReason(err)}。`,
+        calls: 0,
+        error: err.message,
+        requeued,
+      };
     }
   }
 
