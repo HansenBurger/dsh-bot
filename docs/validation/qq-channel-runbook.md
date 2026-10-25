@@ -13,7 +13,8 @@ bot-core → DSH 生成回复 → 发回 QQ**，并要求同时观测“非白�
 | 镜像 digest 核验与固化 | ✅ 已完成（双源一致） | `v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e`，由 `docker buildx imagetools inspect` 与 Hub tag API 交叉核验一致，已写入 `deploy/compose.yaml`（commit `7c80935`）。**t3 G3 的 digest 门禁至此才算满足。** |
 | **NapCat 启动 + 扫码登录** | ✅ 已完成 | 小号 `207346792` 一次性人工扫码登录；之后容器重建走 `ACCOUNT` 快速登录，会话保存在 `data/qq` |
 | **真实 QQ 端到端** | ✅ 已完成 | 主人私信 → echo 回执回到真实 QQ；陌生号私信被 default-deny 拒绝。逐条证据见第 3.5 节 |
-| 记忆链路（真实 QQ 驱动） | ⚠ 不在 echo 口径内 | `BOT_CORE_MODE=echo` 不调模型，也就不会走 `memory_write`；真实消息不产生记忆写入（实测 L1 真号 peer 行数 0）。记忆子系统对真存储 24/24 |
+| **LLM 对话 + 长期记忆** | ✅ 模型链路已实测（合成号） | `BOT_CORE_MODE=llm` 已上线：persona 回复、聊天内审批、记忆落库+召回、超时 fail-closed、代理停机 fail-closed。证据见第 3.6 节；真实账号驱动的三步测试（记住→同意→召回）由主人在 QQ 上发 |
+| 记忆链路（真实 QQ 驱动） | ✅ 口径已切换 | 原 `BOT_CORE_MODE=echo` 不调模型、不写记忆（当时实测 L1 真号 peer 行数 0，属预期）；11:15 起 `deploy/.env` 改 `llm`，记忆读写走第 3.6 节链路。记忆子系统对真存储另有 `scripts/memory-e2e.mjs` 24/24 |
 
 第 1 步失败的真实根因不是网络，而是**任务书里那个 tag 不存在**：`mlikiowa/napcat-docker`
 没有 `0.01.11` 这个 tag（此前所有 `not found`/超时都掩盖了这一点），当前真实 tag 是
@@ -196,7 +197,102 @@ timeout 240 docker run --rm --network bot-net-protocol -v $PWD:/host:ro -w /host
 QQ 消息**不会**写入记忆（实测 `context_entry` 中真号 peer 行数 0，仅有一条 19:44 原型 peer
 的历史行）。记忆子系统对真存储的读写用 `scripts/memory-e2e.mjs` 在容器内实测 **24/24**
 （SQLite L1 + 宿主 PG：写/读/中文检索/审批删除/墓碑/访问账本）。“真实 QQ 消息驱动记忆”
-要等接上模型的那条后续任务。
+要等接上模型的那条后续任务 —— **这条边界已在 2026-10-25 越过：`BOT_CORE_MODE=llm` 上线，
+模型链路与记忆读写见第 3.6 节；真号 peer 目前仍是 0 行，因为主人还没在自己的 QQ 上触发写入。**
+
+## 3.6 LLM 对话 + 长期记忆（2026-10-25，`BOT_CORE_MODE=llm`）
+
+模型链路第一次真跑。口径：**bot-core 的 companion 循环**（persona + 记忆工具 + 聊天内审批）
+→ broker `/v1/llm/*` → squid CONNECT 白名单 → `api.deepseek.com`。不是真 DSH 宿主进程
+（`--profile agent` 仍未启用，见 README 偏差 12）。
+
+**接线与凭据隔离**（bot-core 容器内实测）：
+
+```text
+env: BOT_CORE_MODE=llm  BROKER_URL=http://172.28.2.30:8080  LLM_MODEL=deepseek-flash  APPROVAL_TTL_MS=300000
+env: DEEPSEEK_API_KEY=opaque-ref:llm-key            # 只有引用名
+/run/secrets: enrollment-token, mem-hmac-secret     # 没有 llm-key 这个文件
+GET /v1/secret/llm-key → 403 {"code":"REF_NOT_AUTHORIZED"}
+GET /v1/capabilities   → {"client":"bot-core","allowedRefs":["mem-hmac-secret"],"llmEgress":true}
+```
+
+bot-core 只挂在 `bot-net-ingress` + `bot-net-agent`（都是 internal），且**不在 `net-ops`**，
+所以它连代理本身都够不着：容器内 `curl https://api.deepseek.com/` 报
+`Failed to connect to 172.28.3.40 port 3128`。memory 容器同理（`Could not resolve host`）。
+模型流量唯一出路是 broker，而 broker 两张网也全是 internal：容器内直连
+`https://api.deepseek.com` → `fetch failed`。**没有绕行，也没有静默直连可言。**
+
+**代理不可达 = 报错，不是兜底**（临时 `docker stop` 代理后打一次 `/v1/llm/v1/chat/completions`）：
+
+```json
+{"ts":1792896512068,"type":"llm.egress","clientId":"bot-core","result":"error","reason":"proxy-unreachable",
+ "message":"proxy CONNECT timed out (172.28.3.40:3128)","ms":5001,"via":"proxy:172.28.3.40:3128"}
+```
+客户端拿到 `HTTP 502 {"error":{"code":"UPSTREAM_UNREACHABLE"}}`。恢复代理后同一条路径
+`status:200 / via:"proxy:172.28.3.40:3128"`，squid 侧对应
+`TCP_TUNNEL/200 … CONNECT api.deepseek.com:443 HIER_DIRECT/112.13.210.86`。
+
+**白名单本身曾经形同虚设（本次修掉的 C5 漏洞）**：Ubuntu 镜像的 `conf.d/debian.conf`
+末尾 `http_access allow localnet` 覆盖了 172.16.0.0/12，而我们的规则按文件名排在它**后面**。
+从 broker 手工 CONNECT 实测：
+
+| 目标 | 修复前 | 修复后 |
+|---|---|---|
+| `api.deepseek.com:443` | 200 TCP_TUNNEL | 200 TCP_TUNNEL |
+| `github.com:443` | 200 TCP_TUNNEL | 200 TCP_TUNNEL |
+| `example.com:443` | **200 TCP_TUNNEL** | 403 TCP_DENIED |
+| `evil.example.org:443` | **200 TCP_TUNNEL** | 403 TCP_DENIED |
+| `10.0.0.1:443` | **放行后超时** | 403 TCP_DENIED |
+| `172.28.2.50:8091` | 403（`!SSL_ports` 挡的，不是我们的规则） | 403 TCP_DENIED |
+
+改名 `a01-dshbot-rules.conf` 抢在 `debian.conf` 之前即闭合（commit `3e59e92`）。
+也就是说：在 10:35 之前，broker 带着真 key 可以连任意公网地址。
+
+**记忆读写 + 聊天内审批（合成号 `900000001`，不占用真实账号）**
+签名帧直接投 bot-core intake（`POST /submit`），因此只走模型/记忆链路，不触碰 NapCat，
+也不会给真实 QQ 发任何东西：
+
+```text
+> 请记住：我的测试代号是橙子
+< {"reply":"这条内容会进入长期记忆，请确认。\n（回复「同意」写入，「拒绝」放弃；5 分钟内不作答自动失效）\n要记的是：主人的测试代号是「橙子」。"}
+  审计 approval.outcome stage=requested approvalId=appr-9ecff114bc5ba7f0 toolName=memory_write ttlMs=300000
+> 同意
+< {"reply":"已记住。"}
+  审计 stage=decided decision=approved waitedMs=9570 → stage=applied result=allowed memoryId=d7f64fbd-…
+> 同意            # 重复作答
+< {"reply":"现在没有等你确认的操作，所以什么都没做。"}
+  审计 stage=orphan result=noop（一次性令牌已消费，写次数仍然 1）
+```
+
+落库证据：宿主 PG `companion.user_profile` 一行（`subject_key=qq:dm:900000001`，
+`attr_key=testing.codename`，`value_plain=主人的测试代号是「橙子」。`，visibility=private），
+L1 SQLite `memory_cache` 同 `memory_id`，访问账本
+`memory_access_log` log_id 79 `write/approved`、80 `search/approved`；
+`POST /v1/memories/search {"query":"测试代号"}` 命中该条（`retrievalStrategy:"kv"`）。
+
+**第一条真消息写的不是「已记住」而是失败**：`memory_write` 发 `scope:"dm"` 却不带
+`scopePeer`，`upsertPreference` 直接 400（`非 global 作用域需要 scopePeer`），而**审批令牌
+已经被消费**——人批准了，记忆却丢了，且没有任何重试。已在 `334fc25` 修：peer 由绑定的
+principal 推出（`${channel}:${chatId}`，与 `assertVisible` 的判定形状一致），
+`scopePeer` 不进工具 schema，模型无法把偏好写进别人的会话视图。
+
+**超时 fail-closed**：合成号 `900000002` 发起「记住我的备用测试代号是蓝莓」后不作答，
+11:08 才回「同意」：
+
+```json
+{"type":"approval.outcome","stage":"expired","result":"denied","toolName":"memory_write","waitedMs":378993}
+```
+`select count(*) … subject_key='qq:dm:900000002'` = **0 行**：过期即作废，迟到的批准不写。
+
+**模型人格与配额**：`deepseek-flash` 被上游接受（`GET /v1/llm/models` 返回
+`deepseek-flash = DeepSeek-V4.1-Flash`），单轮 `prompt_tokens≈1038`（两份 system prompt +
+四个工具 schema），`llm.egress ms` 112–134。到本节结束为止上游调用共 5 次
+（models 1 + 打通用 1 + companion 轮 3），另有一次代理停机导致的失败尝试（未达上游）。
+
+**非白名单回归**：`scripts/ingress-e2e.mjs`（isolated，13/13）里 `W2a 非白名单用户收不到回复 —
+api calls=0` + `W2b reason=not-whitelisted` + `W4 文本自称主人不改判决 — api calls=0` 全绿；
+线上 `logs/ingress.jsonl` 13 条 `not-whitelisted` 拒绝之后**没有任何 `submit` 行**，
+即判决发生在 gate，模型根本没被唤起（`deploy/whitelist.json` 未改）。
 
 ## 4. Telegram：明确 deferred（不在本任务范围）
 

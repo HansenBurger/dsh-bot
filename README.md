@@ -117,6 +117,26 @@ scripts/               集成与端到端验证脚本
    不在词表内的类型改写成 `external.message`，限流事件因此一度在日志里“消失”。
 7. **`memory_readable` 视图不含 `created_at`/`attr_key` 列**（迁移里就有这个差异），
    服务层按现有列使用；补齐属于 schema 变更，未在本任务夹带。
+8. **C5 出口代理需要第六条网络 `net-egress`**（172.28.5.0/24，本机唯一开 masquerade 的
+   bridge，除 squid 外无成员）。t3 画的 `proxy` 只挂在 internal 的 `net-ops` 上，于是
+   “白名单代理”物理上到不了任何外网地址，broker 的 CONNECT 一律 `proxy-unreachable`；
+   补一条只给代理用的 masqueraded 腿，转发判定仍然只在 `rules.conf` 里发生。
+9. **squid 镜像引用是幽灵 tag**：t3 写的 `ubuntu/squid:6.10-2404.v1` 上游从未存在（与
+   NapCat 那个假 tag 同类）。真实配对是 `6.6-24.04_beta`，按两条独立来源核验后以
+   `@sha256:8fafd41d…` 钉死。该镜像自行降权（root → uid 13 `proxy`），`cap_drop:[ALL]`
+   会让它 `setgid: Operation not permitted` 崩溃循环，因此给了
+   `SETUID/SETGID/DAC_OVERRIDE/CHOWN` 四个 cap 和 `/run`、`/var/spool/squid` 等 tmpfs，
+   与 NapCat 的降权偏差同性质。
+10. **`conf.d/*.conf` 按文件名顺序生效**：Ubuntu 镜像自带的 `debian.conf` 末尾是
+    `http_access allow localnet`，而 `localnet` 覆盖 172.16.0.0/12（本栈全部地址）。
+    我们的规则原名 `dshbot-rules.conf` 排在它后面，于是白名单形同虚设——实测
+    `CONNECT example.com:443` 被 `TCP_TUNNEL/200` 打通。现改名
+    `a01-dshbot-rules.conf` 抢在 `debian.conf` 之前，并以 `http_access deny all` 收尾。
+11. **审计词表补 `llm.egress`**（同第 6 条的机制）：broker 的模型转发记录（含 fail-closed
+    的 `result:"error"`）此前全被改写成 `external.message`，出口轨迹 grep 不出来。
+12. **本栈的“DSH agent 平面”目前是 bot-core 的 standalone 循环**（`BOT_CORE_MODE=llm`：
+    persona + 记忆工具 + 聊天内审批 → broker `/v1/llm` → squid → 上游），**不是真的 DSH
+    宿主进程**；`--profile agent` 里的 `dshbot-dsh` 仍未运行，接入方式待 t8 定级。
 
 ## 安全要点（改动前必读）
 
@@ -134,9 +154,15 @@ scripts/               集成与端到端验证脚本
 
 ## 已知限制（原型阶段）
 
-* QQ 主链路已用真实账号跑通（白名单私信 → echo 回执回到 QQ，陌生人私信被 default-deny 拒绝，
+* QQ 主链路已用真实账号跑通（白名单私信 → 回执回到 QQ，陌生人私信被 default-deny 拒绝，
   见 [runbook 第 3 节](docs/validation/qq-channel-runbook.md)）；`scripts/ingress-e2e.mjs`
   扮演的假适配器仍在，用途变成回归覆盖而不是唯一证据来源。
+* **模型与记忆链路已接通，但“对话方”仍是合成号**：`BOT_CORE_MODE=llm` 下
+  persona 回复、聊天内审批（同意/拒绝/超时/重复作答）、SQLite L1 + 宿主 PG 落库召回全部
+  实测通过（runbook 第 3.6 节）；这些是用签名帧直投 bot-core intake（`POST /submit`）打的，
+  目的是不向真实 QQ 账号发任何测试消息。真实账号那一头（主人发「记住我喜欢香菜」→「同意」→
+  「我喜欢什么」）仍待人工发送验收，
+  非白名单则仍然只在 gate 被拒、不进模型（`logs/ingress.jsonl` 13 条拒绝之后 0 条 `submit`）。
 * **Telegram 通道整体 deferred（本原型不启用）**：本机到 `api.telegram.org` 网络不可达
   （调研期已证实，也是此前“卡住”的根因）。适配器代码与出站/长轮询实现保留，单测对着本地
   假 API 跑通（`apps/gateway/test/telegram.test.mjs`，11 项，全程不联网），但没有真实 TG
