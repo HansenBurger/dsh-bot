@@ -14,9 +14,23 @@ set -uo pipefail
 
 DSH_GUI_PORT="${DSH_GUI_PORT:-3080}"
 INGRESS_PORT="${INGRESS_PORT:-3001}"
+# T9/t11 移交 + t8 DEV-16：compose 里 memory 管理面（8190）**故意不发布到宿主**——
+# 只绑容器内 loopback（deploy/compose.yaml memory 服务注释："No published ports at
+# all"，健康检查是容器内 curl 127.0.0.1:8190）。这比 t3 的原始期望更紧，属已定级
+# 偏差（DEV-16），不是缺陷。原脚本却把 127.0.0.1:8190 列为必备监听，自 t6 起恒为
+# NO-GO，恰好教人忽略这个门禁——现在期望与现实对齐：宿主机上 8190 必须**不存在**；
+# 哪天有人把它发布出来，这里要变红。MEMORY_ADMIN_HOST_PUBLISHED=1 声明"已按原设计
+# 发布"时反向断言存在。
 MEMORY_ADMIN_PORT="${MEMORY_ADMIN_PORT:-8190}"
+MEMORY_ADMIN_HOST_PUBLISHED="${MEMORY_ADMIN_HOST_PUBLISHED:-0}"
 
-expected=("127.0.0.1:${DSH_GUI_PORT}" "127.0.0.1:${INGRESS_PORT}" "127.0.0.1:${MEMORY_ADMIN_PORT}")
+expected=("127.0.0.1:${DSH_GUI_PORT}" "127.0.0.1:${INGRESS_PORT}")
+forbidden=()
+if [ "${MEMORY_ADMIN_HOST_PUBLISHED}" = "1" ]; then
+  expected+=("127.0.0.1:${MEMORY_ADMIN_PORT}")
+else
+  forbidden+=("127.0.0.1:${MEMORY_ADMIN_PORT}")
+fi
 
 case "${PROFILES:-}" in
   napcat) expected+=("127.0.0.1:3081") ;;
@@ -38,6 +52,14 @@ for addr in "${expected[@]}"; do
   else
     echo "  MISSING  $addr"
     fail=1
+  fi
+done
+for addr in "${forbidden[@]}"; do
+  if listening "$addr"; then
+    echo "  FORBIDDEN $addr —— memory 管理面被发布到宿主，违背 DEV-16 的收紧基线（有意发布时 MEMORY_ADMIN_HOST_PUBLISHED=1 重跑）"
+    fail=1
+  else
+    echo "  ok(absent) $addr —— 管理面按 DEV-16 不发布"
   fi
 done
 
