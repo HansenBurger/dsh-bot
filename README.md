@@ -39,7 +39,9 @@ Secret Broker 凭据隔离。设计文档见 [`docs/design/`](docs/design/)、
 前置条件：Docker + compose v2、Node ≥ 22（`node:sqlite` 内置）、宿主 PostgreSQL 16。
 
 ```bash
-# 1) 生成凭据材料（0600/0644，见脚本输出说明）
+# 1) 生成凭据材料（一律 0600 属主可读写，group/other 位为空；
+#    容器 uid 需要读的用语名 ACL `setfacl -m u:10001:r` 授权，脚本自动打；
+#    事后核查：bash deploy/scripts/assert-secret-modes.sh --containers）
 bash deploy/scripts/gen-secrets.sh
 
 # 2) 配置环境变量
@@ -155,6 +157,10 @@ scripts/               集成与端到端验证脚本
   bot-core 的 guard 与记忆服务端各自拦一道。
 * LLM key 只在 broker 容器里；bot-core 只能请求 `POST /v1/llm/*`，转发前剥掉
   `authorization`/`cookie`/`x-broker-token` 等头，上游响应剥掉 `set-cookie`。
+* 宿主凭据文件（`deploy/secrets/*`、`deploy/.env`）一律 0600 且 group/other 基位为空
+  （t3 审查 R7：此前有 8 个 0644，等于世界可读）；跨 uid 的容器读取靠 named ACL
+  （`setfacl -m u:10001:r`）授权，绝不用 other 位开门。随时核查权限与容器可读性：
+  `bash deploy/scripts/assert-secret-modes.sh --containers`。
 * 宿主实例的 `dsh_companion_rw` / `dsh_companion_ro` 权限矩阵由
   `deploy/scripts/host-pg-prepare.sh` 第 [4/5] 步在线验证，不可执行
   `forget_by_subject`（遗忘由服务自己做，墓碑先写、删除后写）。

@@ -19,14 +19,17 @@ rand() { # 43 base64url chars = 32 bytes
 }
 
 # Containers read these through :ro bind mounts as their own uid (10001 for memory and
-# bot-core). Ownership is the only thing that keeps a *different* container from reading
-# a *sibling's* file when an operator mounts ./secrets wholesale (the broker does), so:
-#   - running this script with sudo + SECRETS_UID (default 10001) yields 0400 files owned
-#     by that uid, which is the intended NAS posture;
-#   - running it unprivileged leaves 0644 files and says so, because mount scoping is then
-#     the only thing doing the work — the operator must know which mode they are in.
+# bot-core, 1000 — the operator's own uid — for broker and ingress). The file *mode* may
+# never carry a group or other bit, not even for the containers (t3 review R7): a 0644
+# secret is world-readable on this shared host, and mount scoping is not a substitute for
+# file permissions. When a container uid that is not the file owner must read a file,
+# grant it by named ACL instead:
+#     sudo setfacl -m u:10001:r deploy/secrets/<file>
+# (uid 10001 reads: enrollment tokens for bot-core/memory, mem-hmac-secret, mem-kek,
+#  mem-pg-*-password; everything uid 1000 consumes is owned by uid 1000 and plain 0600
+#  already covers it). `bash deploy/scripts/assert-secret-modes.sh` checks the result.
 TARGET_UID="${SECRETS_UID:-10001}"
-mode_for() { [[ "$(id -u)" == "0" ]] && echo 0400 || echo 0644; }
+mode_for() { [[ "$(id -u)" == "0" ]] && echo 0400 || echo 0600; }
 
 put() { # put <name> <value>
   local name="$1" value="$2" path="$DIR/$1"
@@ -41,7 +44,7 @@ put() { # put <name> <value>
 }
 
 if [[ "$(id -u)" != "0" ]]; then
-  echo "  NOTE: unprivileged run — files are 0644; mount scoping is then the only isolation." >&2
+  echo "  NOTE: unprivileged run — files are 0600 owned by $(id -un); container uids below get named ACLs." >&2
   echo "        On the NAS: sudo SECRETS_UID=10001 bash deploy/scripts/gen-secrets.sh" >&2
 fi
 put mem-pg-rw-password "$(rand)"
@@ -60,6 +63,15 @@ if [[ ! -e "$DIR/llm-key" ]]; then
   printf '%s\n' "REPLACE-WITH-REAL-PROVIDER-KEY" > "$DIR/llm-key"
   chmod "$(mode_for)" "$DIR/llm-key"
   echo "  wrote llm-key (PLACEHOLDER — replace it)"
+fi
+# Unprivileged posture: hand the 0600 files to the only container uids that must read
+# them (10001 = memory + bot-core). The broker/ingress containers run as uid 1000 — the
+# owner here — so plain 0600 already covers them.
+if [[ "$(id -u)" != "0" ]] && command -v setfacl >/dev/null; then
+  for f in mem-pg-rw-password mem-pg-ro-password mem-kek mem-hmac-secret enroll-memory-service enroll-bot-core; do
+    setfacl -m u:10001:r "$DIR/$f" 2>/dev/null || echo "  WARN: setfacl u:10001:r $f failed — that container will not read it" >&2
+  done
+  echo "  ACL: uid 10001 granted read on the six files it mounts (group/other bits stay empty)"
 fi
 echo
 echo "Next:"
