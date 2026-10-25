@@ -68,8 +68,12 @@ docker compose -f deploy/compose.yaml --profile agent up -d     # DSH Web GUI
 `access_token` 与第 2 步算指纹的那个 token 一致，`self_id` 与 `SELF_ID` 一致。
 原型阶段没有真 QQ 号时，可用 `node scripts/ingress-e2e.mjs` 扮演协议端（见下）。
 
-默认 `BOT_CORE_MODE=queue` 需要一个可用的模型 key；把 `deploy/.env` 里改成 `echo`
-即可在没有 key 的情况下跑通“接入 → 白名单 → 提交 → 回复”整条链路（回复是一条确认文本）。
+`BOT_CORE_MODE` 有三种口径（`apps/bot-core/src/standalone.mjs`）：`queue` 只收下并回执
+「已入队」，**不碰模型也不需要 key**（compose 默认）；`echo` 回一条固定文本，用来验证
+“接入 → 白名单 → 提交 → 回复”整条链路；`llm` 才是伴侣循环（persona + 四个记忆工具 +
+聊天内审批），它需要 `--profile egress` 起着、`deploy/secrets/llm-key` 存在、以及
+`/run/secrets/enrollment-token`，缺任何一环都是**报错而不是绕过去**（见
+[runbook 第 3.6 节](docs/validation/qq-channel-runbook.md)）。本机的 `deploy/.env` 现为 `llm`。
 
 ## 验证
 
