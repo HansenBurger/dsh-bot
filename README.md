@@ -167,10 +167,12 @@ scripts/               集成与端到端验证脚本
   bot-core intake（`POST /submit`）在合成号上覆盖，因为不能往真实 NapCat 会话注假流量，
   也不能向真实 QQ 账号发测试消息。非白名单仍然只在 gate 被拒、不进模型
   （`logs/ingress.jsonl`：13 条陌生号拒绝，46 条 `submit` 的 `role` 只有 `owner`；isolated e2e W2a/W2b `api calls=0`）。
-* **owner 口径免 peer 边界**：`assertVisible` 与检索谓词对 `role=owner` 不做
-  `peer_key` 比对（单一主人的设计意图）。副作用是**任何**以 owner 身份写入的行在主人与真号无关的
-  会话里也会被召回——实测踩过一次（合成号的「测试代号」出现在真号召回结果里），那条已按正规
-  删除路径墓碑。以后凡是以 owner 身份造的测试数据，都必须当场墓碑，不能留库。
+* **owner 免 peer 边界按身份约束（不再是角色位）**：`assertVisible` 与检索谓词里的 owner 例外，
+  现在要求行属于**该 owner 本人**——`peer_key` 命中调用方自己的会话或自己的 DM，或 `subject_id`
+  等于调用方 `channel:dm:userId` 解析出的主体；只凭 `role='owner'` 不再放行。此前白名单里
+  onebot+telegram 两条 owner 并存时，另一通道的 owner 能读到本主人全部 private 行（t3 审查 R2），
+  现已闭合，回归测试在 `apps/memory-service/test/owner-boundary.test.mjs`。删除（forget）仍是
+  角色权限 + 审批门槛，不受本约束影响；以 owner 身份造的测试数据仍须当场墓碑，不能留库。
 * **Telegram 通道整体 deferred（本原型不启用）**：本机到 `api.telegram.org` 网络不可达
   （调研期已证实，也是此前“卡住”的根因）。适配器代码与出站/长轮询实现保留，单测对着本地
   假 API 跑通（`apps/gateway/test/telegram.test.mjs`，11 项，全程不联网），但没有真实 TG

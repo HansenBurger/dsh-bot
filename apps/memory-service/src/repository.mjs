@@ -418,6 +418,7 @@ export class MemoryRepository {
    * ---------------------------------------------------------------- */
 
   async read(memoryId, principal) {
+    principal = await this.#withOwnerIdentity(principal);
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(memoryId)) {
       throw new ServiceError('BAD_REQUEST', 'memoryId must be a uuid', 400);
     }
@@ -488,25 +489,60 @@ export class MemoryRepository {
     return { results: rows.map((r) => ({ ...r, retrievalStrategy: 'l1-cache' })), truncated: projected.truncated, strategy: projected.strategy || {}, chars };
   }
 
+  /**
+   * Review R2: the owner exemption is bound to the owner's *identity*, not to the
+   * role bit. whitelist.json may legitimately carry one owner entry per channel, so
+   * `role === 'owner'` alone says nothing about WHO the row belongs to — a second
+   * owner on another channel would otherwise read the first owner's private rows.
+   * The bypass therefore requires the row to be the caller's own: filed under the
+   * caller's DM subject (`channel:dm:userId` → subject_id) or banked in the caller's
+   * own DM peer. Rows without either link stay peer-bound for every caller.
+   * Dual-shape reads: PG rows carry snake_case, L1 cache rows carry camelCase.
+   */
+  #rowBelongsToCaller(row, principal) {
+    const peer = row.peer_key ?? row.peerKey ?? null;
+    const subject = row.subject_id ?? row.subjectId ?? null;
+    const ownDmPeer = `${principal.channel}:${principal.userId}`;
+    const ownChatPeer = `${principal.channel}:${principal.chatId}`;
+    if (peer && (peer === ownDmPeer || peer === ownChatPeer)) return true;
+    return Boolean(principal.dmSubjectId) && subject === principal.dmSubjectId;
+  }
+
+  /**
+   * For a role=owner principal, resolve their DM subject once per request so the
+   * JS-side and SQL-side owner bypasses compare the same identity. Non-owners get
+   * the principal untouched; an owner with no subject row yet bypasses on nothing.
+   */
+  async #withOwnerIdentity(principal) {
+    if (principal.role !== 'owner' || principal.dmSubjectId !== undefined) return principal;
+    const subjectKey = `${principal.channel}:dm:${principal.userId}`;
+    const subj = await this.subjectByKey(subjectKey);
+    return { ...principal, dmSubjectId: subj?.subject_id ?? null };
+  }
+
   assertVisible(row, principal) {
     const peerKey = `${principal.channel}:${principal.chatId}`;
+    const rowPeer = row.peer_key ?? row.peerKey ?? null;
+    const ownerSelf = principal.role === 'owner' && this.#rowBelongsToCaller(row, principal);
     switch (row.visibility) {
       case 'admin':
         // Never model-visible: only the owner CLI path may read it.
         throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
       case 'owner':
         if (principal.role !== 'owner') throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
+        if (!ownerSelf) throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
         return;
       case 'peer':
-        if (row.peer_key && row.peer_key !== peerKey && principal.role !== 'owner') {
+        if (rowPeer && rowPeer !== peerKey && !ownerSelf) {
           throw new ServiceError('PEER_BOUNDARY_VIOLATION', '记忆不存在或不可见', 404);
         }
         return;
       case 'private':
       default:
-        // private: readable by the subject themself in their own DM, or by owner.
-        const isOwnDm = row.peer_key === peerKey && principal.role !== 'public';
-        if (!isOwnDm && principal.role !== 'owner') throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
+        // private: readable by the subject themself in their own DM, or by the owner
+        // of the row's identity (never merely by "some" owner on some channel).
+        const isOwnDm = rowPeer === peerKey && principal.role !== 'public';
+        if (!isOwnDm && !ownerSelf) throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
     }
   }
 
@@ -523,6 +559,7 @@ export class MemoryRepository {
    */
   async search(req, principal) {
     const started = Date.now();
+    principal = await this.#withOwnerIdentity(principal);
     const limit = Math.min(Math.max(1, Number(req.limit ?? 10)), this.config.maxSearchRows);
     const queryNorm = normalizeText(req.query);
     const qTrigrams = byteTrigrams(queryNorm);
@@ -547,15 +584,19 @@ export class MemoryRepository {
     }
 
     // ---- L3 episodes: byte-trigram recall through the GIN index (CJK main path).
-    //      $1 channel, $2 chatId, $3 role, $4 raw query.
-    const epParams = [principal.channel, principal.chatId, principal.role, req.query];
+    //      $1 channel, $2 chatId, $3 role, $4 raw query, $5 userId, $6 owner subject id.
+    const epParams = [principal.channel, principal.chatId, principal.role, req.query, principal.userId, principal.dmSubjectId ?? null];
+    // Review R2: the "$3 = 'owner'" bypass is bound to the caller's own identity —
+    // rows filed under channel:dm:userId, or banked in the caller's own DM peer.
+    // A second owner entry on another channel matches neither and reads nothing.
+    const ownerSelf = "(e.peer_key = $1 || ':' || $5 OR e.subject_id = $6)";
     const epWhere = [
       'e.superseded_by IS NULL',
       '(e.expires_at IS NULL OR e.expires_at > now())',
       // ACL predicate lives in SQL, not in JS string concatenation (§5.6).
       `(
-           (e.visibility = 'owner' AND $3 = 'owner')
-        OR (e.visibility IN ('private','peer') AND (e.peer_key = $1 || ':' || $2 OR $3 = 'owner'))
+           (e.visibility = 'owner' AND $3 = 'owner' AND ${ownerSelf})
+        OR (e.visibility IN ('private','peer') AND (e.peer_key = $1 || ':' || $2 OR ($3 = 'owner' AND ${ownerSelf})))
        )`,
       "companion.byte_trgm(coalesce(e.body_plain, '')) && companion.byte_trgm($4)",
     ];
@@ -590,7 +631,7 @@ export class MemoryRepository {
        LIMIT $${epParams.length}`;
 
     // ---- L2 profile/preference KV hits: attribute or value match wins outright.
-    const kvParams = [req.query, principal.role, queryNorm.slice(0, 64), limit];
+    const kvParams = [req.query, principal.role, queryNorm.slice(0, 64), limit, principal.dmSubjectId ?? null];
     const kvSql = `
       SELECT p.profile_id AS memory_id, 'profile' AS kind, p.subject_id, NULL::text AS peer_key,
              'profile' AS class, p.attr_key, p.value_plain AS body_plain, p.value_enc AS body_enc,
@@ -600,7 +641,7 @@ export class MemoryRepository {
         FROM companion.user_profile p
        WHERE p.superseded_by IS NULL
          AND p.visibility <> 'admin'
-         AND (p.visibility <> 'owner' OR $2 = 'owner')
+         AND (p.visibility <> 'owner' OR ($2 = 'owner' AND p.subject_id = $5))
          AND (companion.byte_trgm(coalesce(p.value_plain, '')) && companion.byte_trgm($1)
               OR lower(coalesce(p.value_plain, '')) LIKE '%' || $3 || '%'
               OR lower(p.attr_key) LIKE '%' || $3 || '%')
@@ -615,7 +656,7 @@ export class MemoryRepository {
              '{}'::text[] AS risk_tags, NULL::text AS source_channel, f.source_ref
         FROM companion.user_preference f
        WHERE f.visibility <> 'admin'
-         AND (f.visibility <> 'owner' OR $2 = 'owner')
+         AND (f.visibility <> 'owner' OR ($2 = 'owner' AND f.subject_id = $5))
          AND (companion.byte_trgm(coalesce(f.value_plain, '')) && companion.byte_trgm($1)
               OR lower(coalesce(f.value_plain, '')) LIKE '%' || $3 || '%'
               OR lower(f.pref_key) LIKE '%' || $3 || '%')
@@ -721,7 +762,12 @@ export class MemoryRepository {
     const found = await this.pg.query('ro', `SELECT memory_id, kind, class, sensitivity, body_hash, body_plain FROM companion.memory_readable WHERE memory_id = $1`, [memoryId]);
     if (found.rows.length === 0) throw new ServiceError('ACL_DENIED', '记忆不存在或已删除', 404);
     const row = found.rows[0];
-    this.assertVisible({ ...row, visibility: 'owner' }, principal);
+    // Review R2: forget is a *role* capability (owner + approval id below), not a
+    // visibility read — the owner must still be able to tombstone rows belonging to
+    // other subjects (synthetic test data, moderation). The old `assertVisible(
+    // {...row, visibility:'owner'})` tricked the read boundary into an admin check;
+    // with the owner exemption now identity-bound that trick would deny legitimate
+    // tombstones, so the gate is stated plainly instead.
     if (principal.role !== 'owner') throw new ServiceError('FORBIDDEN_ROLE', '遗忘仅限 owner', 403);
 
     if (dryRun) {
@@ -896,7 +942,10 @@ export class MemoryRepository {
     // A context read is scoped to the caller's own peer unless it is the owner:
     // group A's working memory must not surface inside group B (D-06 isolation).
     const ownPeer = `${principal.channel}:${principal.chatId}`;
-    if (peerKey !== ownPeer && principal.role !== 'owner') {
+    const ownDmPeer = `${principal.channel}:${principal.userId}`;
+    // R2: the owner bypass is identity-bound — the caller's own chat, or the caller's
+    // own DM slot on the caller's own channel. Never another channel's "owner".
+    if (peerKey !== ownPeer && peerKey !== ownDmPeer && !(principal.role === 'owner' && peerKey.startsWith(`${principal.channel}:`))) {
       throw new ServiceError('PEER_BOUNDARY_VIOLATION', '上下文仅本会话可读', 403);
     }
     const ctx = this.l1.getContext(peerKey);
@@ -905,7 +954,8 @@ export class MemoryRepository {
 
   putContext(peerKey, body, principal) {
     const ownPeer = `${principal.channel}:${principal.chatId}`;
-    if (peerKey !== ownPeer && principal.role !== 'owner') {
+    const ownDmPeer = `${principal.channel}:${principal.userId}`;
+    if (peerKey !== ownPeer && peerKey !== ownDmPeer && !(principal.role === 'owner' && peerKey.startsWith(`${principal.channel}:`))) {
       throw new ServiceError('PEER_BOUNDARY_VIOLATION', '上下文仅本会话可写', 403);
     }
     const serialized = JSON.stringify(body.value);
