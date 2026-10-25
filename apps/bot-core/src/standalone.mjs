@@ -95,13 +95,18 @@ export async function createStandalone(opts = {}) {
       }
       if (mode === 'llm') {
         const principal = { ...rawPrincipal, peerKind: message.peer?.kind || 'dm' };
+        // T9-F3: `agent.turn` had no duration at all (t9 counted 0 lines with `ms` in the
+        // whole stream), so p50/p95 forensics had to subtract neighbouring timestamps or
+        // trust the probe's own clock. This line is the intake-to-reply boundary; the
+        // per-call model latency stays in `llm.call.ms` and must not be conflated.
+        const turnStarted = Date.now();
         const decided = await loop.resolvePending({ text: message.text, principal });
         if (decided) {
-          audit.emit('agent.turn', { result: 'approval', channel: message.channel, chatId: principal.chatId, calls: decided.calls, applied: Boolean(decided.applied) });
+          audit.emit('agent.turn', { result: 'approval', channel: message.channel, chatId: principal.chatId, calls: decided.calls, applied: Boolean(decided.applied), ms: Date.now() - turnStarted });
           return { reply: decided.reply, queued: false };
         }
         const turn = await loop.turn({ text: message.text, principal });
-        audit.emit('agent.turn', { result: turn.error ? 'error' : 'allowed', channel: message.channel, chatId: principal.chatId, calls: turn.calls, pending: turn.pending, replyChars: turn.reply.length });
+        audit.emit('agent.turn', { result: turn.error ? 'error' : 'allowed', channel: message.channel, chatId: principal.chatId, calls: turn.calls, pending: turn.pending, replyChars: turn.reply.length, ms: Date.now() - turnStarted });
         return { reply: turn.reply, queued: false };
       }
       return { queued: true };
