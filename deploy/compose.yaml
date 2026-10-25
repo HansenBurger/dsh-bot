@@ -281,7 +281,11 @@ services:
       - /var/spool/squid:size=128m,mode=1777
       - /var/log/squid:size=32m,mode=1777
     volumes:
-      - ./egress-proxy/rules.conf:/etc/squid/conf.d/dshbot-rules.conf:ro
+      # `a01-` is load-bearing: squid reads conf.d/*.conf in filename order and the image's
+      # own debian.conf ends with `http_access allow localnet`, which covers 172.16.0.0/12 -
+      # every address in this stack. Under the old `dshbot-rules.conf` name the distro rule
+      # matched first and CONNECTs to non-allowlisted hosts were tunneled anyway.
+      - ./egress-proxy/rules.conf:/etc/squid/conf.d/a01-dshbot-rules.conf:ro
       - ../logs:/var/log/dshbot
     logging: *logging
 
