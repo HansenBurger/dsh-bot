@@ -161,12 +161,16 @@ scripts/               集成与端到端验证脚本
 * QQ 主链路已用真实账号跑通（白名单私信 → 回执回到 QQ，陌生人私信被 default-deny 拒绝，
   见 [runbook 第 3 节](docs/validation/qq-channel-runbook.md)）；`scripts/ingress-e2e.mjs`
   扮演的假适配器仍在，用途变成回归覆盖而不是唯一证据来源。
-* **模型与记忆链路已接通，但“对话方”仍是合成号**：`BOT_CORE_MODE=llm` 下
-  persona 回复、聊天内审批（同意/拒绝/超时/重复作答）、SQLite L1 + 宿主 PG 落库召回全部
-  实测通过（runbook 第 3.6 节）；这些是用签名帧直投 bot-core intake（`POST /submit`）打的，
-  目的是不向真实 QQ 账号发任何测试消息。真实账号那一头（主人发「记住我喜欢香菜」→「同意」→
-  「我喜欢什么」）仍待人工发送验收，
-  非白名单则仍然只在 gate 被拒、不进模型（`logs/ingress.jsonl` 13 条拒绝之后 0 条 `submit`）。
+* **模型与记忆链路已在真号上跑通**（2026-10-25）：主人从 1035376945 发「记住我喜欢香菜」→
+  聊天内审批 →「同意」落宿主 PG →「我喜欢什么」召回该条并自然收口，三段模型调用全部经
+  squid 白名单代理（runbook 第 3.6 节）。审批四态与超时 fail-closed 另用签名帧直投
+  bot-core intake（`POST /submit`）在合成号上覆盖，因为不能往真实 NapCat 会话注假流量，
+  也不能向真实 QQ 账号发测试消息。非白名单仍然只在 gate 被拒、不进模型
+  （`logs/ingress.jsonl`：13 条陌生号拒绝，46 条 `submit` 的 `role` 只有 `owner`；isolated e2e W2a/W2b `api calls=0`）。
+* **owner 口径免 peer 边界**：`assertVisible` 与检索谓词对 `role=owner` 不做
+  `peer_key` 比对（单一主人的设计意图）。副作用是**任何**以 owner 身份写入的行在主人与真号无关的
+  会话里也会被召回——实测踩过一次（合成号的「测试代号」出现在真号召回结果里），那条已按正规
+  删除路径墓碑。以后凡是以 owner 身份造的测试数据，都必须当场墓碑，不能留库。
 * **Telegram 通道整体 deferred（本原型不启用）**：本机到 `api.telegram.org` 网络不可达
   （调研期已证实，也是此前“卡住”的根因）。适配器代码与出站/长轮询实现保留，单测对着本地
   假 API 跑通（`apps/gateway/test/telegram.test.mjs`，11 项，全程不联网），但没有真实 TG

@@ -13,7 +13,7 @@ bot-core → DSH 生成回复 → 发回 QQ**，并要求同时观测“非白�
 | 镜像 digest 核验与固化 | ✅ 已完成（双源一致） | `v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e`，由 `docker buildx imagetools inspect` 与 Hub tag API 交叉核验一致，已写入 `deploy/compose.yaml`（commit `7c80935`）。**t3 G3 的 digest 门禁至此才算满足。** |
 | **NapCat 启动 + 扫码登录** | ✅ 已完成 | 小号 `207346792` 一次性人工扫码登录；之后容器重建走 `ACCOUNT` 快速登录，会话保存在 `data/qq` |
 | **真实 QQ 端到端** | ✅ 已完成 | 主人私信 → echo 回执回到真实 QQ；陌生号私信被 default-deny 拒绝。逐条证据见第 3.5 节 |
-| **LLM 对话 + 长期记忆** | ⚠ 真号已写入+审批通过，召回待重发 | `BOT_CORE_MODE=llm` 已上线。合成号：persona 回复、审批四态（同意/重复作答/超时/他人冒答）、落库与检索全绿。真号 1035376945：「记住我喜欢香菜」→「同意」→「已记住。」并落 PG（food.like）；紧随其后的「我喜欢什么」死在历史形状的 400（`3c493a9` 已修，bot-core 已重启，待主人重发第三条）。证据见第 3.6 节 |
+| **LLM 对话 + 长期记忆** | ✅ 真号端到端通过 | `BOT_CORE_MODE=llm` 已上线。真号 1035376945：「记住我喜欢香菜」→审批问句→「同意」→「已记住。」落 PG（`food.like`）→「我喜欢什么」→ 答「就一条吃的偏好：你喜欢香菜」，三段都经 squid 白名单代理。中途暴露并修掉两个真 bug（`334fc25` scopePeer、`3c493a9` 历史形状毒化）。合成号侧另覆盖审批四态与超时 fail-closed。证据见第 3.6 节 |
 | 记忆链路（真实 QQ 驱动） | ✅ 口径已切换 | 原 `BOT_CORE_MODE=echo` 不调模型、不写记忆（当时实测 L1 真号 peer 行数 0，属预期）；11:15 起 `deploy/.env` 改 `llm`，记忆读写走第 3.6 节链路。记忆子系统对真存储另有 `scripts/memory-e2e.mjs` 24/24 |
 
 第 1 步失败的真实根因不是网络，而是**任务书里那个 tag 不存在**：`mlikiowa/napcat-docker`
@@ -315,10 +315,12 @@ principal 推出（`${channel}:${chatId}`，与 `assertVisible` 的判定形状�
 bot-core 在 11:49 与 11:57 各重建一次（`llm.ready` model=deepseek-flash，healthy），会话历史与
 审批队列是进程内的，重启即清空——所以真号那条被毒化的历史已经不存在。
 
-**测试留下的行**：合成号写了一条 `subject_key='qq:dm:900000001'` / `attr_key=testing.codename`
-（「主人的测试代号是「橙子」。」）。它不会污染真号的召回——`assertVisible` 按
-`peer_key = ${channel}:${chatId}` 判定，真号是 `onebot:1035376945`。删除要走 `memory_forget`
-的主人审批（模型参与，要烧配额），本轮按预算不动它；清理属于后续任务。
+**测试留下的行（已清）**：合成号曾写进一条 `subject_key='qq:dm:900000001'` /
+`attr_key=testing.codename`（「主人的测试代号是「橙子」。」）。它**确实会**出现在真号的召回结果里
+——owner 口径免 peer 边界，见上一节——所以不能留：12:37 走正规删除路径（dryRun 预览 →
+`/forget?dryRun=false` + 一次性令牌）墓碑掉，`memory_tombstone` 留了 `object_hash`、
+`reason_code user_forget`、`approval_id`，access log 89 `delete/allowed`；复跑检索「测试代号」0 行。
+库里现在只剩真号那一条 `food.like`。备份里仍含该条直至下次轮换（§8.6/R-6，服务自己的口径）。
 
 **超时 fail-closed**：合成号 `900000002` 发起「记住我的备用测试代号是蓝莓」后不作答，
 11:08 才回「同意」：
@@ -337,8 +339,65 @@ bot-core 在 11:49 与 11:57 各重建一次（`llm.ready` model=deepseek-flash�
 
 **非白名单回归**：`scripts/ingress-e2e.mjs`（isolated，13/13）里 `W2a 非白名单用户收不到回复 —
 api calls=0` + `W2b reason=not-whitelisted` + `W4 文本自称主人不改判决 — api calls=0` 全绿；
-线上 `logs/ingress.jsonl` 13 条 `not-whitelisted` 拒绝之后**没有任何 `submit` 行**，
-即判决发生在 gate，模型根本没被唤起（`deploy/whitelist.json` 未改）。
+线上 `logs/ingress.jsonl` 里 13 条 `not-whitelisted` 拒绝（12 DM + 1 群，跨 19:42–23:25）之后
+**没有任何一条非 owner 的 `submit`**：全库 46 条 `submit` 的 `role` 只有 `owner` 一个取值，
+即判决发生在 gate，模型根本没被陌生号唤起（`deploy/whitelist.json` 未改，owner 那 5 条是今天
+真号自己的消息）。
+
+**这节的证据边界（给 review 看）**：
+
+| 断言 | 证据级别 | 备注 |
+|---|---|---|
+| 审批四态 requested / decided / applied / orphan-noop / expired | 线上审计实测 | 合成号 + 真号都有；`logs/agent.jsonl` |
+| 「拒绝」真机一态 | **仅单测**（`approvalWord` + `ApprovalQueue`） | 真机测它要先造一条 pending，那要烧 1 次推理；额度留给召回 |
+| 他人冒答不改写 | 单测 + `principal-mismatch` 分支代码 | 未在线上用真号演 |
+| 真号召回（第 3 条消息） | **线上实测通过（12:34）** | `3c493a9` 前它必 400；修复上线后一条消息连开两轮工具、第三轮收口，答的就是 PG 里那行 `food.like` |
+| 记忆写入落 PG/L1 + 访问账本 | 线上实测（真号 ca2d68e8 / log 81 写，82–85 检索） | 合成号遗留行已按正规路径墓碑（log 89） |
+| 非白名单零调用 | isolated e2e（W2a/W2b `api calls=0`）+ 线上 13 条陌生号拒绝、46 条 submit 全是 owner | 不往真实 NapCat 注假流量 |
+| key 隔离 / 无直连出口 | broker-e2e 17/17 + 本节容器内实测 | 含 `GET /v1/secret/llm-key` → 403 |
+
+**真号召回（12:34，`3c493a9` 上线后重发第 3 条）**——端到端补齐：
+
+```text
+12:34:26  接收 <- 私聊 (1035376945) 我喜欢什么
+          ingress authz.decision stage:gate role:owner allowed → stage:submit status:200 ms:3040
+          llm.call #1 allowed finishReason:tool_calls toolCalls:2 prompt 1032/completion 177 ms 1182
+          llm.call #2 allowed finishReason:tool_calls toolCalls:2 prompt 1302/completion 132 ms  987
+          llm.call #3 allowed finishReason:stop      toolCalls:0 prompt 1679/completion  37 ms  789
+          agent.turn result:allowed chatId:1035376945 calls:3 pending:false replyChars:59
+12:34:29  发送 -> 私聊 (1035376945) 我这边记着的，就一条吃的偏好：你喜欢香菜 🌿 ...
+```
+
+上游三段都走代理：`llm.egress` 三条 `status:200 via:"proxy:172.28.3.40:3128"`（ms 113/139/130），
+squid 侧三条 `TCP_TUNNEL/200 CONNECT api.deepseek.com:443`。记忆侧四条 `search/allowed`
+（access log 82–85，`rows_returned` 1/0/1/2），主体是那一行真号偏好：
+
+```text
+companion.user_preference: subject_key onebot:dm:1035376945 / scope dm / scope_peer onebot:1035376945
+                           pref_key food.like / value_plain「主人喜欢香菜。」/ visibility private
+```
+
+主人在 QQ 上看到的原文（用户转述；审计记的是 `replyChars:59`，NapCat 控制台把日志截成了带 `...`
+的一行，两处都对不上整句长度，以 QQ 里的那条为准）：
+**「我这边记着的，就一条吃的偏好：你喜欢吃香菜；别的爱好、口味啥的，我这儿还是空白。想让我记住什么跟我说一句就行」**
+——召回正确、人格自然、对没记的东西直说空白而不是编。
+
+**这一轮顺手量出来的一个真实副作用（不是 bug，但要写清楚）**：`assertVisible` 与 SQL 谓词
+（`repository.mjs:501` 的 `peer` 分支、`:558` 的 `OR $3 = 'owner'`、`:212` 的 `isOwner`）
+对 **role=owner 免 peer 边界**——单一主人的部署里这是设计意图，但它意味着任何以 owner 身份
+写进去的行，主人在任何会话都看得见。所以我用合成号 `qq:dm:900000001`（owner 口径）测试写入的
+「主人的测试代号是「橙子」。」**真的进了这轮的召回结果**（access log 85 `rows_returned:2`）。
+模型没被它带偏（答的是「吃的偏好」），但测试数据污染真号召回这件事本身不可接受，已按正规
+删除路径清掉：dryRun 预览 → `POST /v1/memories/{id}/forget?dryRun=false` 带一次性令牌 →
+`memory_tombstone` 一行（`object_hash 4937a51c…`、`reason_code user_forget`、
+`approval_id appr-cleanup-1a171599710`）+ access log 89 `delete/allowed`。清完复跑检索：
+「测试代号」0 行、「喜欢」1 行，库里剩下的唯一一行就是真号那条 `food.like`。
+
+**配额账本（口径：产出 token 的推理调用）**：真号召回这轮花 3 次（12:34:26 一条消息让模型连开两轮
+工具，第三轮才收口），累计 **8 次产出 token 的推理调用**（models 列表 1 次零消耗、代理停机 1 次未达
+上游、上游 400 2 次零消耗，都不在这口径里），到 12:34 之后**不再有任何自发起的调用**。
+按上游请求计数则是 8 请求 = 5×200(chat) + 2×400 + models 1；两个口径都在 `logs/broker.jsonl`
+/`logs/agent.jsonl` 里可复核。
 
 ## 4. Telegram：明确 deferred（不在本任务范围）
 
