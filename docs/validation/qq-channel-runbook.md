@@ -13,7 +13,7 @@ bot-core → DSH 生成回复 → 发回 QQ**，并要求同时观测“非白�
 | 镜像 digest 核验与固化 | ✅ 已完成（双源一致） | `v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e`，由 `docker buildx imagetools inspect` 与 Hub tag API 交叉核验一致，已写入 `deploy/compose.yaml`（commit `7c80935`）。**t3 G3 的 digest 门禁至此才算满足。** |
 | **NapCat 启动 + 扫码登录** | ✅ 已完成 | 小号 `207346792` 一次性人工扫码登录；之后容器重建走 `ACCOUNT` 快速登录，会话保存在 `data/qq` |
 | **真实 QQ 端到端** | ✅ 已完成 | 主人私信 → echo 回执回到真实 QQ；陌生号私信被 default-deny 拒绝。逐条证据见第 3.5 节 |
-| **LLM 对话 + 长期记忆** | ✅ 模型链路已实测（合成号） | `BOT_CORE_MODE=llm` 已上线：persona 回复、聊天内审批、记忆落库+召回、超时 fail-closed、代理停机 fail-closed。证据见第 3.6 节；真实账号驱动的三步测试（记住→同意→召回）由主人在 QQ 上发 |
+| **LLM 对话 + 长期记忆** | ⚠ 真号已写入+审批通过，召回待重发 | `BOT_CORE_MODE=llm` 已上线。合成号：persona 回复、审批四态（同意/重复作答/超时/他人冒答）、落库与检索全绿。真号 1035376945：「记住我喜欢香菜」→「同意」→「已记住。」并落 PG（food.like）；紧随其后的「我喜欢什么」死在历史形状的 400（`3c493a9` 已修，bot-core 已重启，待主人重发第三条）。证据见第 3.6 节 |
 | 记忆链路（真实 QQ 驱动） | ✅ 口径已切换 | 原 `BOT_CORE_MODE=echo` 不调模型、不写记忆（当时实测 L1 真号 peer 行数 0，属预期）；11:15 起 `deploy/.env` 改 `llm`，记忆读写走第 3.6 节链路。记忆子系统对真存储另有 `scripts/memory-e2e.mjs` 24/24 |
 
 第 1 步失败的真实根因不是网络，而是**任务书里那个 tag 不存在**：`mlikiowa/napcat-docker`
@@ -276,6 +276,40 @@ L1 SQLite `memory_cache` 同 `memory_id`，访问账本
 principal 推出（`${channel}:${chatId}`，与 `assertVisible` 的判定形状一致），
 `scopePeer` 不进工具 schema，模型无法把偏好写进别人的会话视图。
 
+**真实账号那一趟（11:32，主人从 1035376945 发给 207346792）**：前两步是真过的——
+
+```text
+11:31:56  接收 <- 私聊 (1035376945) 记住我喜欢香菜
+          agent.turn result:allowed calls:1 pending:true   （模型调 memory_write，挂起等审批）
+          approval.outcome stage:requested appr-7c998ce4c63b4992 ttlMs:300000
+11:32:06  接收 <- 私聊 (1035376945) 同意
+          approval.outcome stage:decided decision:approved waitedMs:10512
+          approval.outcome stage:applied result:allowed memoryId:ca2d68e8-cd58-4c81-8c63-8df340f39a78
+11:32:07  发送 -> 私聊 (1035376945) 已记住。
+          PG companion.user_preference: subject onebot:dm:1035376945 / pref_key food.like
+             / "主人喜欢香菜。" / visibility private；memory_access_log 81 write approved=true allowed
+11:32:13  接收 <- 私聊 (1035376945) 我喜欢什么
+11:32:13  发送 -> 私聊 (1035376945) 我现在连不上模型，稍后再试。      <-- 这里才是问题
+```
+
+第三条**不是连不上**，是上游 400，而且措辞把排查方向带偏了：
+
+```json
+{"type":"llm.call","result":"error","reason":"upstream-400","model":"deepseek-flash","call":4,"ms":115,
+ "detail":"{\"error\":{\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id' (insufficient tool messages fol"}
+{"type":"llm.egress","clientId":"bot-core","target":"api.deepseek.com/chat/completions","status":400,"ms":111,"via":"proxy:172.28.3.40:3128"}
+```
+
+代理、key、模型、网络全都是好的（上游把请求体解析了才会这么答）。真因：审批挂起那一轮把带
+`tool_calls` 的 assistant 消息写进了会话历史就直接 return，没有给任何 tool 结果，于是**这个会话
+之后的每一条消息都不合法**，一直到进程重启。`3c493a9` 修：挂起时本轮每个 call id 都补一条
+`tool-pending` 占位（provider 的硬性不变式），主人答复后再用 `settlePendingCall` 把占位改写成
+真实结局——不改写的话模型下一轮仍然认为“还在等确认”，会答非所问。回归测试对修复前的源码会报
+`unanswered tool_calls c2 would be rejected with 400`，修复后 bot-core 37/37、`npm test` 166/166。
+
+遗留的措辞问题（未改）：任何 `chat()` 异常都回同一句「我现在连不上模型」，把上游 4xx（请求被拒）
+说成连接故障。审计里 `reason` 是对的，人看到的不是；留给后续任务，改法是把 4xx 与网络错误分开。
+
 **超时 fail-closed**：合成号 `900000002` 发起「记住我的备用测试代号是蓝莓」后不作答，
 11:08 才回「同意」：
 
@@ -286,8 +320,10 @@ principal 推出（`${channel}:${chatId}`，与 `assertVisible` 的判定形状�
 
 **模型人格与配额**：`deepseek-flash` 被上游接受（`GET /v1/llm/models` 返回
 `deepseek-flash = DeepSeek-V4.1-Flash`），单轮 `prompt_tokens≈1038`（两份 system prompt +
-四个工具 schema），`llm.egress ms` 112–134。到本节结束为止上游调用共 5 次
-（models 1 + 打通用 1 + companion 轮 3），另有一次代理停机导致的失败尝试（未达上游）。
+四个工具 schema），`llm.egress ms` 111–134。到 11:50 为止上游共 **7 次请求**：5 次成功
+（models 1 + 打通用 1 + companion 轮 3，其中含真号那一次写入）+ 2 次被 400 拒绝（未产出 token，
+见上一节）；另有一次代理停机导致的失败（请求未达上游）。预算口径 ≤8，剩余按 3 次计。
+诊断这 2 次 400 没有再花配额：复现靠脚本化的假模型（单测），通路是否健康由这 2 次 400 本身证明。
 
 **非白名单回归**：`scripts/ingress-e2e.mjs`（isolated，13/13）里 `W2a 非白名单用户收不到回复 —
 api calls=0` + `W2b reason=not-whitelisted` + `W4 文本自称主人不改判决 — api calls=0` 全绿；
