@@ -355,16 +355,18 @@ export class CompanionLoop {
       this.audit.emit('approval.outcome', { stage: 'orphan', result: 'noop', decision, chatKey: key, role: principal.role });
       return { reply: '现在没有等你确认的操作，所以什么都没做。', calls: 0, orphan: true };
     }
+    // R5: an approval word counts only for the principal that opened the conversation.
+    // Any other sender must leave the pending *untouched* — the old code consumed it
+    // (`take`) even on the deny path, so one group-chat "拒绝"/"同意" from a bystander
+    // burned the owner's pending and settled the history with a false decision.
+    if (pending.principal.userId !== principal.userId || pending.principal.channel !== principal.channel) {
+      this.audit.emit('approval.outcome', { stage: 'ignored', result: 'noop', approvalId: pending.id, toolName: pending.toolName, chatKey: key, reason: 'non-owner-approval-word', role: principal.role });
+      return { reply: '这条确认不是发给你的，我没有执行。', calls: 0, ignored: true };
+    }
     if (decision === 'denied') {
       this.approvals.take(key, 'denied');
       this.settlePendingCall(pending.historyKey, pending.callId, '主人拒绝了这条操作，没有执行。');
       return { reply: '好，这条没有写入记忆。', calls: 0, denied: true };
-    }
-    if (pending.principal.userId !== principal.userId || pending.principal.channel !== principal.channel) {
-      this.approvals.take(key, 'denied');
-      this.settlePendingCall(pending.historyKey, pending.callId, '这条确认不是发给当前会话的，没有执行。');
-      this.audit.emit('approval.outcome', { stage: 'decided', approvalId: pending.id, result: 'denied', reason: 'principal-mismatch', chatKey: key });
-      return { reply: '这条确认不是发给你的，我没有执行。', calls: 0, denied: true };
     }
     const tool = this.byName.get(pending.toolName);
     if (!tool) {

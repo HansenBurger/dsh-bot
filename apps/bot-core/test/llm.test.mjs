@@ -219,12 +219,31 @@ test('a bare 同意 with nothing pending is a no-op that writes nothing', async 
   assert.match(out.reply, /什么都没做/);
 });
 
-test('approval must come from the same principal that opened the conversation', async () => {
-  const { loop: l, memory } = loop({ script: [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'preference', body: 'x' })] });
+test('approval must come from the same principal that opened the conversation (R5: and burns nothing)', async () => {
+  const { loop: l, memory, sink } = loop({ script: [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'preference', body: 'x' })] });
   await l.turn({ text: '记住这个', principal: OWNER });
-  const stolen = await l.resolvePending({ text: '同意', principal: { ...OWNER, userId: '999', chatId: '1035376945' } });
-  assert.equal(stolen.denied, true);
+  const key = l.approvals.key(OWNER);
+  const impostor = { channel: 'onebot', chatId: '1035376945', userId: '999', role: 'trusted', peerKind: 'dm' };
+
+  // a bystander's "同意" is a complete no-op: pending survives, history stays untouched
+  const stolen = await l.resolvePending({ text: '同意', principal: impostor });
+  assert.equal(stolen.ignored, true);
   assert.equal(memory.writes.length, 0);
+  assert.equal(l.approvals.peek(key)?.args?.body, 'x', 'the owner pending must still be there');
+  const hist = l.history.get(l.historyKey(OWNER));
+  assert.match(hist.find((m) => m.role === 'tool' && m.tool_call_id === 'c1').content, /等待主人在私聊里确认/, 'the placeholder is not settled by a stranger');
+
+  // even a bystander "拒绝" must not burn the pending (the old code took it on the deny path)
+  const denyBurn = await l.resolvePending({ text: '拒绝', principal: impostor });
+  assert.equal(denyBurn.ignored, true);
+  assert.equal(l.approvals.peek(key)?.args?.body, 'x');
+
+  // the ignored words are audited, and the real owner can still approve normally
+  const lines = readFileSync(sink.path, 'utf8');
+  assert.match(lines, /"stage":"ignored"[^\n]*non-owner-approval-word/);
+  const applied = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(applied.applied, true);
+  assert.equal(memory.writes.length, 1);
 });
 
 test('the shared guard still denies: non-owner deletes and foreign subjects', async () => {
@@ -299,3 +318,106 @@ test('BrokerLlmClient: sends the enrollment token, never an authorization header
   assert.doesNotMatch(log, /tok-bot-core/);
   assert.match(log, /"promptTokens":11/);
 });
+
+/** Build one assistant message that calls several tools in a single round. */
+function multiCall(calls) {
+  return { role: 'assistant', content: '', finish_reason: 'tool_calls',
+    tool_calls: calls.map(([id, name, args]) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } })) };
+}
+
+test('R3: deferral mid-list answers EVERY remaining tool_call and stays replay-safe', async () => {
+  // slice(i) form never covered before: [ran, DEFER, untouched, untouched] — the deferred
+  // call and the two behind it all need a tool message, or the next request dies 400.
+  const w = (body) => ({ subjectKey: 'onebot:dm:1035376945', class: 'preference', body });
+  const script = [
+    multiCall([
+      ['c1', 'memory_search', { query: '香菜' }],
+      ['c2', 'memory_write', w('主人喜欢香菜')],
+      ['c3', 'memory_search', { query: '辣椒' }],
+      ['c4', 'memory_write', w('主人讨厌辣椒')],
+    ]),
+    { role: 'assistant', content: '都处理好了。', finish_reason: 'stop' },
+  ];
+  const { loop: l, memory } = loop({ script });
+  const first = await l.turn({ text: '搜两条，再记两条', principal: OWNER });
+  assert.equal(first.pending, true);
+  assert.equal(memory.searches.length, 1, 'only the calls *before* the deferral ran');
+  assert.equal(memory.writes.length, 0);
+
+  const hist = l.history.get(l.historyKey(OWNER));
+  const toolOf = (id) => l.history.get(l.historyKey(OWNER)).find((m) => m.role === 'tool' && m.tool_call_id === id);
+  for (const id of ['c2', 'c3', 'c4']) {
+    assert.ok(toolOf(id), `${id} must be answered in the stored history`);
+    assert.match(toolOf(id).content, /本轮未执行/);
+  }
+  for (const seen of l.llm.seen) assertAnsweredToolCalls(seen.messages, 'deferring request');
+
+  // the owner answers: *only* the pending call settles; the untouched tail stays honest
+  const decided = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(decided.applied, true);
+  assert.equal(memory.writes.length, 1, 'c4 was never approved by anyone answering c2');
+  assert.match(toolOf('c2').content, /主人已同意/);
+  assert.match(toolOf('c3').content, /本轮未执行/);
+  assert.doesNotMatch(toolOf('c3').content, /主人已同意/);
+
+  // follow-up turn replays the multi-call round: still provider-valid
+  const second = await l.turn({ text: '我喜欢什么', principal: OWNER });
+  assert.equal(second.reply, '都处理好了。');
+  assert.equal(second.error, undefined);
+  for (const seen of l.llm.seen) assertAnsweredToolCalls(seen.messages, 'post-decision request');
+});
+
+test('R3: a plain multi-call round (no deferral) continues into the next request answered', async () => {
+  const script = [
+    multiCall([
+      ['c1', 'memory_search', { query: '香菜' }],
+      ['c2', 'memory_search', { query: '辣椒' }],
+    ]),
+    { role: 'assistant', content: '查到了两条。', finish_reason: 'stop' },
+  ];
+  const { loop: l, memory } = loop({ script });
+  const out = await l.turn({ text: '查两个', principal: OWNER });
+  assert.equal(out.reply, '查到了两条。');
+  assert.equal(memory.searches.length, 2, 'both calls of the round executed');
+  const replayed = l.llm.seen[1].messages;
+  assertAnsweredToolCalls(replayed, 'continuation request');
+  assert.ok(replayed.some((m) => m.role === 'tool' && m.tool_call_id === 'c1'));
+  assert.ok(replayed.some((m) => m.role === 'tool' && m.tool_call_id === 'c2'));
+});
+
+test('R4: expiry settles the placeholder — history never claims "waiting" after the window died', async () => {
+  let now = 10_000;
+  const sink = audit();
+  const memory = fakeMemory();
+  const llm = fakeLlm([toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'preference', body: '香菜' }, 'c1')]);
+  const l = new CompanionLoop({
+    llm,
+    memory,
+    audit: sink,
+    approvals: new ApprovalQueue({ ttlMs: 60_000, audit: sink, now: () => now }),
+    principalOf: () => OWNER,
+    bindPrincipal: () => OWNER,
+    subjectHint: () => 'onebot:dm:1035376945',
+  });
+  const out = await l.turn({ text: '记住香菜', principal: OWNER });
+  assert.equal(out.pending, true);
+  const key = l.historyKey(OWNER);
+  const toolMsg = () => l.history.get(key).find((m) => m.role === 'tool' && m.tool_call_id === 'c1');
+  assert.match(toolMsg().content, /等待主人在私聊里确认/);
+
+  // the window dies; expiry is only *noticed* lazily — here by a too-late 同意
+  now += 61_000;
+  const late = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(late.orphan, true, 'an expired approval is never approvable');
+  assert.equal(memory.writes.length, 0);
+  assert.match(toolMsg().content, /超时，这一步没有执行/);
+  assert.doesNotMatch(toolMsg().content, /等待主人/);
+  assertAnsweredToolCalls(l.history.get(key), 'expired history');
+  assert.match(readFileSync(sink.path, 'utf8'), /"stage":"expired"/);
+
+  // and the next real turn still sends a provider-valid replay
+  const next = await l.turn({ text: '我喜欢什么', principal: OWNER });
+  assert.equal(next.error, undefined);
+  for (const seen of llm.seen) assertAnsweredToolCalls(seen.messages, 'post-expiry request');
+});
+
