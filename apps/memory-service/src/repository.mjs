@@ -418,7 +418,7 @@ export class MemoryRepository {
    * ---------------------------------------------------------------- */
 
   async read(memoryId, principal) {
-    principal = await this.#withOwnerIdentity(principal);
+    principal = await this.#withCallerSubjects(principal);
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(memoryId)) {
       throw new ServiceError('BAD_REQUEST', 'memoryId must be a uuid', 400);
     }
@@ -509,15 +509,33 @@ export class MemoryRepository {
   }
 
   /**
-   * For a role=owner principal, resolve their DM subject once per request so the
-   * JS-side and SQL-side owner bypasses compare the same identity. Non-owners get
-   * the principal untouched; an owner with no subject row yet bypasses on nothing.
+   * Resolve the caller's subject identities once per request. R2 bound the *owner*
+   * bypass to `channel:dm:userId`; review N1 extends the same identity machinery to
+   * every caller, because the L2 KV legs carry no reliable peer_key - the subject link
+   * is the only identity they have, and without it any non-owner caller read every
+   * other subject's profile/preference rows. `groupSubjectId` is resolved only when
+   * the call arrives from a chat that is not the caller's own DM.
    */
-  async #withOwnerIdentity(principal) {
-    if (principal.role !== 'owner' || principal.dmSubjectId !== undefined) return principal;
-    const subjectKey = `${principal.channel}:dm:${principal.userId}`;
-    const subj = await this.subjectByKey(subjectKey);
-    return { ...principal, dmSubjectId: subj?.subject_id ?? null };
+  async #withCallerSubjects(principal) {
+    if (principal.dmSubjectId !== undefined) return principal;
+    const dm = await this.subjectByKey(`${principal.channel}:dm:${principal.userId}`);
+    let group = null;
+    if (principal.chatId !== principal.userId) {
+      group = await this.subjectByKey(`${principal.channel}:group:${principal.chatId}`);
+    }
+    return {
+      ...principal,
+      dmSubjectId: dm?.subject_id ?? null,
+      groupSubjectId: group?.subject_id ?? null,
+    };
+  }
+
+  /** Rows without a peer dimension (profiles, global prefs) are scoped by subject. */
+  #subjectIsCaller(row, principal) {
+    const subject = row.subject_id ?? row.subjectId ?? null;
+    if (!subject || principal.role === 'public') return false;
+    if (principal.dmSubjectId && subject === principal.dmSubjectId) return true;
+    return Boolean(principal.groupSubjectId) && subject === principal.groupSubjectId;
   }
 
   assertVisible(row, principal) {
@@ -536,13 +554,20 @@ export class MemoryRepository {
         if (rowPeer && rowPeer !== peerKey && !ownerSelf) {
           throw new ServiceError('PEER_BOUNDARY_VIOLATION', '记忆不存在或不可见', 404);
         }
+        // Review N1: a 'peer' row *without* a peer dimension (profile KV) has no chat
+        // to hide behind - fall back to the subject link, exactly like the SQL legs.
+        if (!rowPeer && !ownerSelf && !this.#subjectIsCaller(row, principal)) {
+          throw new ServiceError('PEER_BOUNDARY_VIOLATION', '记忆不存在或不可见', 404);
+        }
         return;
       case 'private':
       default:
         // private: readable by the subject themself in their own DM, or by the owner
         // of the row's identity (never merely by "some" owner on some channel).
         const isOwnDm = rowPeer === peerKey && principal.role !== 'public';
-        if (!isOwnDm && !ownerSelf) throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
+        // Review N1: peer-less private KV (profiles, global prefs) is scoped by subject.
+        const isSelfSubject = rowPeer === null && this.#subjectIsCaller(row, principal);
+        if (!isOwnDm && !isSelfSubject && !ownerSelf) throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
     }
   }
 
@@ -559,7 +584,7 @@ export class MemoryRepository {
    */
   async search(req, principal) {
     const started = Date.now();
-    principal = await this.#withOwnerIdentity(principal);
+    principal = await this.#withCallerSubjects(principal);
     const limit = Math.min(Math.max(1, Number(req.limit ?? 10)), this.config.maxSearchRows);
     const queryNorm = normalizeText(req.query);
     const qTrigrams = byteTrigrams(queryNorm);
@@ -631,7 +656,21 @@ export class MemoryRepository {
        LIMIT $${epParams.length}`;
 
     // ---- L2 profile/preference KV hits: attribute or value match wins outright.
-    const kvParams = [req.query, principal.role, queryNorm.slice(0, 64), limit, principal.dmSubjectId ?? null];
+    //      Review N1: the KV legs used to filter visibility only - any non-owner
+    //      caller fetched every other subject's rows. KV carries no episode-style
+    //      peer key, so the identity predicate is the *subject* link ($5 own dm,
+    //      $6 own group), with the preference leg additionally honouring rows filed
+    //      in the caller's own chat ($7:$8). Same construction as the episode leg.
+    const kvParams = [
+      req.query,
+      principal.role,
+      queryNorm.slice(0, 64),
+      limit,
+      principal.dmSubjectId ?? null,
+      principal.groupSubjectId ?? null,
+    ];
+    // the preference leg additionally binds the caller's own chat for scope_peer
+    const prefParams = [...kvParams, principal.channel, principal.chatId];
     const kvSql = `
       SELECT p.profile_id AS memory_id, 'profile' AS kind, p.subject_id, NULL::text AS peer_key,
              'profile' AS class, p.attr_key, p.value_plain AS body_plain, p.value_enc AS body_enc,
@@ -642,6 +681,7 @@ export class MemoryRepository {
        WHERE p.superseded_by IS NULL
          AND p.visibility <> 'admin'
          AND (p.visibility <> 'owner' OR ($2 = 'owner' AND p.subject_id = $5))
+         AND (p.subject_id = $5 OR p.subject_id = $6)
          AND (companion.byte_trgm(coalesce(p.value_plain, '')) && companion.byte_trgm($1)
               OR lower(coalesce(p.value_plain, '')) LIKE '%' || $3 || '%'
               OR lower(p.attr_key) LIKE '%' || $3 || '%')
@@ -657,6 +697,7 @@ export class MemoryRepository {
         FROM companion.user_preference f
        WHERE f.visibility <> 'admin'
          AND (f.visibility <> 'owner' OR ($2 = 'owner' AND f.subject_id = $5))
+         AND (f.subject_id = $5 OR f.subject_id = $6 OR f.scope_peer = $7 || ':' || $8)
          AND (companion.byte_trgm(coalesce(f.value_plain, '')) && companion.byte_trgm($1)
               OR lower(coalesce(f.value_plain, '')) LIKE '%' || $3 || '%'
               OR lower(f.pref_key) LIKE '%' || $3 || '%')
@@ -666,7 +707,7 @@ export class MemoryRepository {
     const [episodes, profiles, preferences] = await Promise.all([
       this.pg.query('ro', episodeSql, epParams).then((r) => r.rows),
       this.pg.query('ro', kvSql, kvParams).then((r) => r.rows),
-      this.pg.query('ro', prefSql, kvParams).then((r) => r.rows),
+      this.pg.query('ro', prefSql, prefParams).then((r) => r.rows),
     ]);
 
     const scored = [];

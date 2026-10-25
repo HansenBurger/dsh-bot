@@ -15,12 +15,15 @@ import { MemoryRepository } from '../src/repository.mjs';
 
 const MASTER = '1035376945';
 const TG_OWNER = '777000000';
+const TRUSTED_ID = '900000001';
 const MASTER_SUBJECT = '11111111-2222-3333-4444-555555555555';
+const TRUSTED_SUBJECT = '33333333-4444-5555-6666-777777777777';
+const GROUP_SUBJECT = '44444444-5555-6666-7777-888888888888';
 const ROW_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
 const qqOwner = () => ({ channel: 'onebot', chatId: MASTER, userId: MASTER, role: 'owner' });
 const tgOwner = () => ({ channel: 'telegram', chatId: TG_OWNER, userId: TG_OWNER, role: 'owner' });
-const trusted = () => ({ channel: 'onebot', chatId: '900000001', userId: '900000001', role: 'trusted' });
+const trusted = () => ({ channel: 'onebot', chatId: TRUSTED_ID, userId: TRUSTED_ID, role: 'trusted' });
 
 /** Row as the PG view returns it (snake_case). */
 const privateRow = (over = {}) => ({
@@ -49,9 +52,15 @@ function fakePg({ rows = [] } = {}) {
     async query(mode, sql, params) {
       calls.push({ mode, sql, params });
       if (sql.includes('FROM companion.subject WHERE subject_key')) {
-        // identity is per-subject-key: only the QQ master's DM key resolves to their uuid
-        const hit = params[0] === `onebot:dm:${MASTER}` ? MASTER_SUBJECT : '99999999-8888-7777-6666-555555555555';
-        return { rows: [{ subject_id: hit, identity_trust: 'server_backed', is_owner: true }] };
+        // identity is per-subject-key, server-backed: each principal resolves to its own
+        // uuid and nothing else; unknown keys legitimately have no subject row yet
+        const SUBJECTS = {
+          [`onebot:dm:${MASTER}`]: MASTER_SUBJECT,
+          [`onebot:dm:${TRUSTED_ID}`]: TRUSTED_SUBJECT,
+          'onebot:group:222': GROUP_SUBJECT,
+          [`telegram:dm:${TG_OWNER}`]: '99999999-8888-7777-6666-555555555555',
+        };
+        return { rows: [{ subject_id: SUBJECTS[params[0]] ?? null, identity_trust: 'server_backed', is_owner: true }] };
       }
       if (sql.includes('memory_readable')) return { rows };
       return { rows: [] };
@@ -163,4 +172,55 @@ test('R2: forget remains role-gated and is not blocked by the identity-bound rea
   const res = await r.forget(ROW_UUID, { principal: qqOwner(), dryRun: true });
   assert.equal(res.dryRun, true, 'the owner may tombstone a foreign-subject row (dry-run shows the preview)');
   await assert.rejects(r.forget(ROW_UUID, { principal: trusted(), dryRun: true }), (e) => e.code === 'FORBIDDEN_ROLE');
+});
+
+/* ---------------- review N1: the L2 KV legs are identity-bound for *every* caller ---------------- */
+
+test('N1: a trusted search binds both KV legs to its own subjects, never to the master', async () => {
+  const pg = fakePg();
+  const r = repo(pg);
+  const out = await r.search({ query: '香菜' }, trusted());
+  assert.equal(out.results.length, 0);
+
+  const kv = pg.calls.find((c) => c.sql.includes('FROM companion.user_profile p'));
+  const pref = pg.calls.find((c) => c.sql.includes('FROM companion.user_preference f'));
+  // pre-N1 these clauses did not exist at all: any trusted caller fetched the master's
+  // private profile/preference rows, because the KV legs filtered visibility only.
+  assert.match(kv.sql, /\(p\.subject_id = \$5 OR p\.subject_id = \$6\)/);
+  assert.match(pref.sql, /\(f\.subject_id = \$5 OR f\.subject_id = \$6 OR f\.scope_peer = \$7 \|\| ':' \|\| \$8\)/);
+  assert.equal(kv.params[4], TRUSTED_SUBJECT, 'the trusted caller binds its own dm subject');
+  assert.equal(kv.params[5], null, 'a DM call resolves no group subject');
+  assert.ok(
+    !kv.params.includes(MASTER_SUBJECT) && !pref.params.includes(MASTER_SUBJECT),
+    'the master identity never appears in a trusted caller\u0027s KV bindings',
+  );
+});
+
+test('N1: a group caller binds the group subject and its own chat peer', async () => {
+  const pg = fakePg();
+  const r = repo(pg);
+  await r.search({ query: '规则' }, { channel: 'onebot', chatId: '222', userId: TRUSTED_ID, role: 'trusted' });
+  const kv = pg.calls.find((c) => c.sql.includes('FROM companion.user_profile p'));
+  const pref = pg.calls.find((c) => c.sql.includes('FROM companion.user_preference f'));
+  assert.equal(kv.params[4], TRUSTED_SUBJECT);
+  assert.equal(kv.params[5], GROUP_SUBJECT, 'the group conversation subject is resolved for group calls');
+  assert.deepEqual([pref.params[6], pref.params[7]], ['onebot', '222'], 'scope_peer is bound to the caller\u0027s own chat');
+});
+
+test('N1: peer-less KV rows are subject-bound through read() as well', async () => {
+  const profileRow = (over = {}) =>
+    privateRow({ kind: 'profile', class: 'profile', peer_key: null, body_plain: '喜欢香菜', ...over });
+
+  // the subject themself may now read their own peer-less private profile row
+  const rOwn = repo(fakePg({ rows: [profileRow({ subject_id: TRUSTED_SUBJECT })] }));
+  const out = await rOwn.read(ROW_UUID, trusted());
+  assert.equal(out.body, '喜欢香菜');
+
+  // the same caller reading the *master's* profile row (the leak) is 404
+  const rForeign = repo(fakePg({ rows: [profileRow({ subject_id: MASTER_SUBJECT })] }));
+  await assert.rejects(rForeign.read(ROW_UUID, trusted()), (e) => e.status === 404);
+
+  // and 'peer'-visibility without a peer dimension no longer falls through to everyone
+  const rPeer = repo(fakePg({ rows: [profileRow({ subject_id: MASTER_SUBJECT, visibility: 'peer' })] }));
+  await assert.rejects(rPeer.read(ROW_UUID, trusted()), (e) => e.status === 404);
 });
