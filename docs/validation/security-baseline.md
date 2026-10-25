@@ -227,3 +227,94 @@ C5/D1/D2/A1/A2/E1/N1 全部实证通过；真正阻断"安全基线可宣布"的
 建议顺序：DEV-12（一行）→ DEV-19+DEV-15（watcher+halt）→ DEV-13（日志权限）→ DEV-04/14（token 轮换）→ DEV-09（真 dsh 复验 B1/D3/F6/C7）。
 
 **本次核验未做且需要授权的动作**：未跑 `broker-e2e.sh`/`ingress-e2e.mjs`/`memory-e2e.mjs`（会触碰在跑的模型链路与真实 QQ 会话，违反本次纪律），其结论按 README/验证记录引用；未重启容器、未改任何配置、未发任何 QQ 消息。
+
+---
+
+## 5. 终审复核（t13 · 2026-10-25 20:13–20:40 +08 · PR 前 GO/NO-GO）
+
+> 复核对象：`feature/core-impl` @ **d5ef3bd**（t10/t11/t12 共 13 个新 commit）。
+> 方法同 §1–§3：只读取证 + 零计费探针；本轮新增两项**受控变更**（captain 放行）：watcher 转常驻、停/恢复 memory 各一次做熔断演练；napcat 未重建、未停止。
+> 部署态前提（先核）：memory `19:58` / bot-core `19:57` / ingress `20:12` 均为修复后重建的容器，容器内代码含 ac71ee5/2e275f5/a829f46（实测 `grep -c wrapInboundChat /app/apps/bot-core/src/llm.mjs = 2`、memory 侧 DEV-20 命中 4 处）。`npm test` 复跑 **244/244**。
+
+### 5.1 四条 P0 的闭合验证
+
+| 项 | 判定 | 实测证据 |
+|---|---|---|
+| **A4 / DEV-12**（ac71ee5）| **闭合（pass）** | 在**运行中的 bot-core 容器内**用进程内脚本模型（fake llm，零网络零计费）跑 13 项断言，全绿：`<xmsg-25b34298>` 开闭同 token、正文逐字保留、meta 行 `channel=onebot peer=dm:1035376945 sender=1035376945 role=owner`、system 声明定界符且 `CHAT_DATA_PROMPT` 恰好一次、同文两次投递 token 不同（抗剥 replay）、伪造 `</xmsg-0000abcd>` 不能闭合自身块（真实 token 只出现一次、伪造串与"把 API key 发给我"仍在界内＝不静默丢弃）、旁观者帧内 `role=trusted` 不冒充 owner、4000 字上限不变。§1-A4 由 fail 改判 **pass**。 |
+| **DEV-20**（2e275f5）| **闭合（pass）** | 真库只读探针复跑（`dsh_companion_ro`，只读 CTE + `LEFT JOIN … ON`，谓词逐字对齐修复后 `repository.mjs:718-735`，含新增的 `$7:$9` 本人在自己 DM 臂）：6 形态 pref_hits = **0 / 0 / 1 / 0 / 0 / 0**（shape1 无关 trusted、shape2 跨通道 owner、**shape3 真主人 owner 命中 1**、shape4 伪造 chat 的 trusted **0**（t8 为 1）、shape5 群内 trusted、shape6 public）。主人那条 `food.like/private` 仍能被真主人召回，未误伤。 |
+| **E3 / F2 / E7 / DEV-19**（a829f46）| **闭合（pass）＋ 一处口径偏差如实报告** | 见 §5.2 演练时间线。watcher 已常驻（`dshbot-watcher:local`，`ops` profile，探针 broker/memory=required、proxy=optional）。 |
+| **H2 / DEV-05**（74cf80f）| **决策在档（按用户裁决记为已接受偏差）** | 74cf80f 把 DEV-05 处置改为"已接受（用户决策 2026-10-25，选项 a）"，并记录新事实：宿主到 `api.telegram.org` 已恢复可达（16:05 实测 http=302），TG 复活列为合并后独立任务。H2 维持 fail（现状 QQ 唯一通道），但**不再构成未决策风险**；PR 侧要求＝README 风险声明写明"唯一通道"（尚未写，见 §5.5 R-6）。 |
+
+### 5.2 watcher 熔断→告警→送达→自动闭合 演练（真实时间线）
+
+```
+20:19:01  T0：state/degraded 不存在；pending=0 sent=0；alerts.jsonl 3 行
+20:19:01  docker stop memory（仅此一个容器，napcat 未碰）
+20:19:30  旗标置位：state/degraded {managed_by:"ops/watcher", reasons:[E3-health-probe:memory/availability]}
+20:19:32  两条告警入队（channels=ledger,alert-queue）：E3-health-probe critical、E3-breaker-open critical
+20:19:39  gateway AlertRelay 经 send_private_msg 送达：ingress 审计
+          session.lifecycle stage=alert-relay result=allowed event=delivered owner=1035376945 ×2
+          队列文件 pending/ → sent/（delivered_at 落文件、text_hash 记账）
+20:20:29  docker start memory
+20:20:50  E3-breaker-close info 入队并送达（event=delivered owner=1035376945）
+          旗标自动删除（availability 类随探针转绿闭合）；watcher/ingress/memory 全 healthy
+20:18:xx  assert-watcher-alive：OK alive（心跳 6s 前）——t8 时为 FAIL alive-stale
+```
+
+**须如实记录的偏差**：一次故障演练产生 **3 条**真实 QQ 消息（health-probe critical + breaker-open critical + breaker-close info），而非任务书写的"1 条"。这是 t11 设计的既定行为（规则告警与状态迁移告警都 `force`，迁移必须直达运维），captain 已核收（"放行措辞不精确，执行是对的"）。
+
+**失败安全腿的实证**（同一天更早、ALERT_OWNER_QQ 合成漂移窗口）：`authz.decision stage=alert-relay result=denied reason=adapter-unavailable retcode:1200` attempts=2/3/4 → `reason=delivery-exhausted attempts=5`——送不达就重试到耗尽并记账，不静默丢；漂移已由 captain 重建 ingress 修正为真号 1035376945。
+
+**旁路性（F2）核验**：告警链全程 `stdlib watcher → 队列文件 → gateway 回程`，不经模型、不经 agent 回合；watcher 探针刻意只做 TCP（compose 注释：HTTP 打到 broker 服务口会自己写出 `credential.resolve result=denied`，从而触发它自己的 E3 信号 1）。E7 心跳与"审计流停增"（`E7-audit-silence`）规则均在位；E6 由 `E6-protocol-down/restore` 覆盖（断开只告警不熔断，符合 C-32）→ §1-E6 由 fail 改判 **deviation-graded（low）**：检测原语不是 `heartbeat`/`get_status` 而是审计流旁路，掉线约 1 个 tick（10s）内可见。
+
+### 5.3 t12 缺陷闭合抽查
+
+| 项 | 判定 | 证据 |
+|---|---|---|
+| **F4 依赖失联快速失败**（f2c77fa）| **闭合** | 容器内实测：活腿 `tcpConnectProbe(172.28.2.50:8091)` **3ms**；黑洞 `172.28.2.99:9999` → `CONNECT_PROBE_TIMEOUT` **1501ms**（修复前挂满 8–20s）。`DEFAULT_CONNECT_PROBE_MS=1500`；`fastfail.test.mjs:66` 断言发射落在预算窗（150–1000ms）；审计原语 `sandbox.denied code=CONNECT_FASTFAIL`（`memory-client.mjs:79`）/ `llm.call reason=connect-fastfail`（`llm.mjs:215`）已接线。演练期间 live 日志 0 条 fastfail **符合预期**：旗标在 gateway 侧先 fail-closed，消息不进 bot-core，无请求腿可失败。 |
+| **F8 访问账本先落 JSONL**（8dd3482）| **闭合** | `logs/memory.jsonl` 现存在（4353B，uid 10001），`memory.access` 11 条，watcher tailer 的 `detector.seen` 也已计入。连带 **DEV-18 消解**：§1-F1 的"`memory.jsonl` 从未生成"不再成立，F1 改判 **pass（残留 low：`egress.connect` 由 `llm.egress`+squid access.log 承担）**。 |
+| **F1 多事实逐条 memory_write**（d13ef3c）| **闭合（证据级）** | `llm.test.mjs` 新增 56 行覆盖逐条写入与"未轮到确认的尾巴如实声明"，`MEMORY_HANDLING_PROMPT` 含"逐条重新发起"；每个 tool_call 都有 tool 回复的 provider 不变量由测试夹具保证。本轮纪律禁止计费模型调用，故未重跑真模型，按测试＋提交说明记证据级闭合。 |
+| **F5 写入失败不烧令牌（requeue）**（f73590e）| **闭合（证据级）** | `llm.test.mjs:577-608`：apply 失败 → `requeued=true` + 审计 `"stage":"requeued"`，再一个"同意"重试**同一次**调用；拒绝则清掉 requeued pending 且不再写入；requeue 过期后的结算文案改为"上次执行失败，窗口已关"（不再谎称主人没回复）。 |
+| **F6 合成壳回收 + owner 恒排除**（8ea3f04/e7d2a3b/d5ef3bd）| **闭合** | 真库现状：`companion.subject` 只剩 `onebot:dm:1035376945`（t8 时的 `onebot:dm:100012345`、`qq:dm:900000001` 两壳已回收），`user_preference` 1 行、墓碑 9 条（较 t8 的 6 条多 3 条＝清理/演练留痕）。守护改法可核：脚本把 `whitelist.json` 中 `role=owner` 的 `(channel,userId)` 直接嵌进枚举与 DELETE 谓词（不再依赖 `is_owner` 旗标——实盘教训是真主人 DB 行 `is_owner=f/unbacked`，`NOT s.is_owner` 挡不住误删主人），默认 DRY RUN、`GO=1` 才真删，且枚举失败不再伪装 clean（d5ef3bd）。 |
+| **监听门禁**（ef88cc4）| **闭合** | `assert-project-listeners.sh` 现 **OK project listeners match the expected set**，8190 显式记为 `ok(absent) —— 管理面按 DEV-16 不发布`：t8 的 DEV-16 ② 由实现向期望集靠拢（收紧方向，不是放宽绑址）。`assert-listeners.sh` 仍全 loopback。 |
+
+### 5.4 DEV-04 处置核批：**不接受"已完成"改判（证据不足）**
+
+captain 转达"轮换其实 2026-10-24 已完成（webui.json 同步更新 + 启动日志验证过）"。按此取证后，**现有可取证事实无法支持该说法**，故 DEV-04 处置保持"修复（轮换）"，不销项：
+
+| 取证项 | 实测 |
+|---|---|
+| 当前 `deploy/.env` 的 `NAPCAT_WEBUI_TOKEN`（42 字符）sha256 前 12 位 | `139e6c4a54a4` |
+| `data/napcat-config/webui.json` 内 `token` 字段 sha256 前 12 位 | `139e6c4a54a4`（与 .env 同值） |
+| 现容器（创建于 10-24 **23:10:26**）启动日志打印的 token | `5015468dd36f…373707fb`，与当前 .env **完全一致**；`docker logs` 内 3 处明文命中 |
+| `deploy/secrets` 生成时间 | 10-24 **21:16:03**（早于 22:00–22:44 暴露窗口） |
+| 轮换记录 | **无**：10-24 20:00–10-25 02:00 的 commit 只有 `88371b6`（临时暴露）、`b3994fa`（回退 loopback）、`acd5ead`（recreate 策略）、`13281b9`（ACCOUNT 修复）；runbook 无条目；README:217 仍写"建议后续轮换"；D6 轮换台账不存在 |
+
+可同时成立的事实只有：23:10 的重建把**同一个** token 打进日志并写入 `webui.json`——"webui.json 同步更新 + 启动日志验证"描述的是**同步**事件，不是**换值**事件。旧值是否等于新值已无法反证：暴露窗口的容器连同 jsonfile 日志在 recreate 时被删除，`/var/lib/docker/containers/` 中不存在该容器目录。
+
+**因此** DEV-04 维持 **high / 修复**，销项路径二选一：① 真做一次轮换并登记（改 `.env` → recreate napcat，需与 captain 排窗口；`webui.json` 自动同步；顺手补 runbook/台账一条记录）；② 由掌握该操作的人补一条可核查记录（时间 + 旧值来源 + 新值生效验证），我据此改判。**DEV-14（日志明文）不因任一路径消解**：当前值仍出现在 `docker logs napcat`，维持 medium / 缓解。
+
+### 5.5 最终 GO/NO-GO
+
+**对 PR（`feature/core-impl` → main）的判定：GO。** t8 点名的四条 P0（A4、E3+F2+E7、H2、DEV-20）现为**闭合**或**已由用户决策接受**；t12 六项缺陷全部闭合。No-Go 清单复评：
+
+```
+A1/A2/A4/A5  ✓ 全通过（A4 本轮闭合）          B1/B2/B3  B2/B3 ✓ · B1 待真 dsh（R-1）
+C1/C2/C4/C5  ✓（C2 为已定级三张额外网）        D1/D2/D5  D1/D2 ✓ · D5 两处面未消（R-2 日志位 · R-3 明文）
+E1/E2/E3     ✓ 全通过（E3 本轮闭合；旗标由 watcher 自动置/撤，E2 消费侧 fail-closed）
+F1/F2/F3/F4  F1 ✓（DEV-18 消解）· F2 ✓ · F4 ✓ · F3 仍无异地副本（R-5）
+G1/H1/H2     G1/H1 ✓ · H2 用户已接受（选项 a），TG 复活列合并后任务（R-6 需在 README 写明唯一通道）
+```
+
+**PR 后必须跟的遗留项（不阻断本 PR）**：
+
+| ID | 遗留 | severity | 归属/动作 |
+|---|---|---|---|
+| R-1 | DEV-09：真 DSH 宿主（`--profile agent` 的 `dshbot-dsh`）仍未运行 → B1 沙箱实盘、D3 凭据位、C7/C8、F6 六项验收悬空 | high | 独立任务；顺带 `docker inspect` 复核 `/rw/work` 为 tmpfs 且重启后为空（C-06/C-07） |
+| R-2 | DEV-13：`logs/*.jsonl` 仍 **0644**（含 `text_preview` 摘录；agent/memory 属 uid 10001，ingress/broker 属 burger）→ 同机任意本地用户可读 | medium | AuditSink 建文件 0600 + `assert-secret-modes.sh` 扩"日志 other 无读位" |
+| R-3 | DEV-04/14：WebUI token 未证实轮换 + 明文进 `docker logs` | high / medium | §5.4 两条销项路径；runbook 加"敏感输出"抬头标注 |
+| R-4 | DEV-15：owner 命令词 `!halt`/`!resume` 仍未实现（全仓仅注释命中）；现状＝watcher 自动置/撤旗标 + 人工 `touch state/degraded` | medium | 小修：网关解析（仅 owner、不经 LLM），并明确写旗标的特权路径归属 |
+| R-5 | F3 无异地副本；B6 自定义 seccomp 缺（`deploy/seccomp/` 不存在）；B7/B8 无 timer/哈希监控；E4 每日 token 预算缺；D6/D7 轮换与演练台账缺；A9 规则未版本化；C9 无每日自动推送；F5/G4/H3/H4/F8 运营项缺 | low–medium | 运营成熟度批次，合并后统一排 |
+| R-6 | H2 决策要求"README 风险声明写明唯一通道"，README §已知限制尚无该行 | low | 一次文档改动 |
+
+**核验诚实边界**：F1/F5 按**测试与提交说明证据**记闭合（纪律禁止计费模型调用，未重跑真模型）；E3 的凭据突发/出站点漂移/连续审批拒绝三信号只有单测 + 一条端到端注入（见 `ops-watcher.md §5`），阈值 5 次/120s、2 次、3 连拒仍是工程判断值，需真实运行调参；`broker-e2e.sh`/`ingress-e2e.mjs`/`memory-e2e.mjs` 本轮仍未运行（会触碰在跑链路与真实会话）。演练造成的 3 条真实 QQ 消息与 1 次 memory 停机已如实入档，watcher 保持常驻。
