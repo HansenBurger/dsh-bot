@@ -58,6 +58,7 @@ export class ApprovalQueue {
     this.audit = audit;
     this.now = now;
     this.byChat = new Map();
+    this.onExpire = null;
   }
 
   key(principal) {
@@ -94,6 +95,12 @@ export class ApprovalQueue {
     if (this.now() > pending.expiresAt) {
       this.byChat.delete(key);
       this.audit.emit('approval.outcome', { stage: 'expired', result: 'denied', approvalId: pending.id, toolName: pending.toolName, chatKey: key, waitedMs: this.now() - pending.createdAt });
+      // R4: the expiry must also settle the history. The provider-shape invariant
+      // ("every tool_call_id gets a tool message") was satisfied by the placeholder,
+      // but "等待主人确认" lies forever once nobody can confirm any more: the next turn
+      // would read a dead deferral as a live one. The loop wires onExpire to rewrite
+      // the placeholder with the real outcome (see CompanionLoop below).
+      if (this.onExpire) this.onExpire(pending, key);
       return null;
     }
     return pending;
@@ -197,6 +204,15 @@ export class CompanionLoop {
     this.llm = llm;
     this.audit = audit;
     this.approvals = approvals || new ApprovalQueue({ audit });
+    // R4: when a pending expires, the tool-pending placeholder in the stored history is
+    // rewritten to the true outcome. Expiry is only ever *noticed* lazily (peek), so the
+    // settle rides on that same moment - no timers, nothing left saying "waiting".
+    if (!this.approvals.onExpire) {
+      this.approvals.onExpire = (pending) => {
+        if (!pending || !pending.callId) return;
+        this.settlePendingCall(pending.historyKey, pending.callId, `主人没有回复，确认窗口（${Math.round((this.approvals.ttlMs ?? 300_000) / 60_000)} 分钟）已超时，这一步没有执行。`);
+      };
+    }
     this.maxRounds = maxRounds;
     this.subjectHint = subjectHint;
     this.history = new Map();
