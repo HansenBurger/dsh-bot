@@ -114,6 +114,7 @@ services:
       SUBMIT_PORT: "3005"
       SUBMIT_BIND: 0.0.0.0
       MAX_CONCURRENT_RUNS: "2" # E1
+      DEP_CONNECT_PROBE_MS: ${DEP_CONNECT_PROBE_MS:-1500} # T9-F4: 依赖停机的连接层快速失败（broker/memory 共用拨号超时）
       BOT_CORE_MODE: ${BOT_CORE_MODE:-queue}
       AUDIT_SINK: /var/log/dshbot/agent.jsonl
       AGENT_ADMIN_PORT: "8185"

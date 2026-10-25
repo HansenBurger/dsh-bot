@@ -37,8 +37,11 @@ export async function createStandalone(opts = {}) {
 
   const mode = env.BOT_CORE_MODE || 'queue';
   if (!['queue', 'echo', 'llm'].includes(mode)) throw new Error(`bot-core: unknown BOT_CORE_MODE "${mode}" (expected queue|echo|llm)`);
+  // T9-F4: one dial timeout for every dependency leg (broker LLM egress + memory REST).
+  // A stopped container must cost ~this many ms of an intake slot, not 8-20s.
+  const connectProbeMs = Number(env.DEP_CONNECT_PROBE_MS ?? 1500);
   const memoryHmac = await resolver.resolve(env.MEM_HMAC_SECRET_REF || env.BOT_SUBMIT_HMAC_KEY_REF, { label: 'mem-hmac-secret', literalAllowed: env.NODE_ENV === 'test' ? undefined : false });
-  const memory = memoryHmac ? new MemoryClient({ baseUrl: env.MEMORY_SERVICE_URL || 'http://172.28.0.50:8091', hmacSecret: memoryHmac, audit }) : null;
+  const memory = memoryHmac ? new MemoryClient({ baseUrl: env.MEMORY_SERVICE_URL || 'http://172.28.0.50:8091', hmacSecret: memoryHmac, audit, connectProbeMs }) : null;
 
   // `llm` mode is the model-backed companion. It reaches DeepSeek only through the
   // broker's LLM egress proxy: this process holds an enrollment token and the *name* of
@@ -56,7 +59,7 @@ export async function createStandalone(opts = {}) {
     }
     if (!memory) throw new Error('bot-core: llm mode needs the memory HMAC secret (no unauthenticated memory writes)');
     const brokerUrl = env.BROKER_URL || 'http://172.28.2.30:8080';
-    const llm = new BrokerLlmClient({ brokerUrl, token, model: env.LLM_MODEL || 'deepseek-flash', audit });
+    const llm = new BrokerLlmClient({ brokerUrl, token, model: env.LLM_MODEL || 'deepseek-flash', audit, connectProbeMs });
     const approvals = new ApprovalQueue({ ttlMs: Number(env.APPROVAL_TTL_MS || 300000), audit });
     let bound = null;
     loop = new CompanionLoop({
@@ -72,7 +75,7 @@ export async function createStandalone(opts = {}) {
       },
       subjectHint: (p) => `${p.channel}:${p.peerKind || 'dm'}:${p.peerKind === 'group' ? p.chatId : p.userId}`,
     });
-    llmInfo = { brokerUrl, model: llm.model, approvalTtlMs: approvals.ttlMs };
+    llmInfo = { brokerUrl, model: llm.model, approvalTtlMs: approvals.ttlMs, connectProbeMs };
     LOG({ event: 'llm.ready', ...llmInfo });
   }
 

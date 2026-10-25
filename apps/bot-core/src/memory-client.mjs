@@ -14,6 +14,7 @@
  */
 
 import { signedHeaders } from '@dsh-bot/bot-hmac';
+import { assertDependencyReachable, DEFAULT_CONNECT_PROBE_MS } from './net-probe.mjs';
 
 export class MemoryClientError extends Error {
   constructor(code, message, status) {
@@ -25,7 +26,8 @@ export class MemoryClientError extends Error {
 
 export class MemoryClient {
   /**
-   * @param {{baseUrl: string, hmacSecret: string, fetchImpl?: Function, timeoutMs?: number, audit?: {emit:(t:string,f:object)=>void}}} opts
+   * @param {{baseUrl: string, hmacSecret: string, fetchImpl?: Function, timeoutMs?: number, audit?: {emit:(t:string,f:object)=>void},
+   *          connectProbeMs?: number, dependencyProbe?: Function}} opts
    */
   constructor(opts) {
     this.baseUrl = String(opts.baseUrl || '').replace(/\/+$/, '');
@@ -33,6 +35,10 @@ export class MemoryClient {
     this.fetch = opts.fetchImpl || globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 8000;
     this.audit = opts.audit || null;
+    // T9-F4: the memory container answers instantly or not at all; a hung TCP connect must
+    // not sit on an intake slot for 8s (MAX_CONCURRENT_RUNS=2 means two of those = dark).
+    this.connectProbeMs = opts.connectProbeMs ?? DEFAULT_CONNECT_PROBE_MS;
+    this.probe = opts.dependencyProbe || assertDependencyReachable;
     if (!this.baseUrl) throw new MemoryClientError('CONFIG', 'memory client needs a base url');
     if (!this.hmacSecret || this.hmacSecret.length < 16) throw new MemoryClientError('CONFIG', 'memory client HMAC secret missing or too short');
   }
@@ -62,6 +68,18 @@ export class MemoryClient {
       }),
     };
     if (raw !== undefined) headers['content-type'] = 'application/json';
+    // T9-F4: a stopped container's bridge IP answers nothing — without a connect-layer
+    // check this call would sit in TCP connect until the 8s abort and burn an intake
+    // slot (MAX_CONCURRENT_RUNS=2: two of those and everything bounces AGENT_BUSY).
+    // The probe fails the same fail-closed path the abort already used, just in ~1.5s.
+    if (this.connectProbeMs > 0) {
+      try {
+        await this.probe({ baseUrl: this.baseUrl, timeoutMs: this.connectProbeMs });
+      } catch (err) {
+        this.audit?.emit('sandbox.denied', { stage: 'memory-client', path, result: 'error', code: 'CONNECT_FASTFAIL', ms: this.connectProbeMs, message: String(err.message).slice(0, 90) });
+        throw new MemoryClientError('MEMORY_UNREACHABLE', '记忆服务不可达', 503);
+      }
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let res;

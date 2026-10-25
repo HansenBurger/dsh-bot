@@ -376,6 +376,9 @@ test('BrokerLlmClient: sends the enrollment token, never an authorization header
     token: 'tok-bot-core',
     model: 'deepseek-flash',
     audit: sink,
+    // the network is stubbed here; the T9-F4 connect probe would dial a name that does
+    // not exist. Fast-fail behaviour gets its own tests in fastfail.test.mjs.
+    connectProbeMs: 0,
     fetchImpl: async (url, opts) => {
       Object.assign(headers, opts.headers);
       return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 11, completion_tokens: 2 } }) };

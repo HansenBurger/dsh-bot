@@ -23,6 +23,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { envelope, redactOutbound } from '@dsh-bot/bot-sanitize';
+import { assertDependencyReachable, DEFAULT_CONNECT_PROBE_MS } from './net-probe.mjs';
 import { createMemoryTools, createMemoryGuard, MEMORY_HANDLING_PROMPT, PERSONA_PROMPT } from './index.mjs';
 
 /** A deferral, not a denial: the human decision is pending, so nothing is written yet. */
@@ -165,7 +166,7 @@ export class ApprovalQueue {
  * sink — only counts, status, latency, and token usage.
  */
 export class BrokerLlmClient {
-  constructor({ brokerUrl, token, model = 'deepseek-flash', audit, fetchImpl = globalThis.fetch, timeoutMs = 60_000 } = {}) {
+  constructor({ brokerUrl, token, model = 'deepseek-flash', audit, fetchImpl = globalThis.fetch, timeoutMs = 60_000, connectProbeMs = DEFAULT_CONNECT_PROBE_MS, dependencyProbe = assertDependencyReachable } = {}) {
     if (!brokerUrl) throw new Error('llm: brokerUrl is required (the agent has no direct WAN route by design)');
     if (!token) throw new Error('llm: enrollment token is required');
     this.brokerUrl = String(brokerUrl).replace(/\/+$/, '');
@@ -174,6 +175,11 @@ export class BrokerLlmClient {
     this.audit = audit;
     this.fetch = fetchImpl;
     this.timeoutMs = timeoutMs;
+    // T9-F4: same reasoning as the memory client — the broker container is either
+    // instantly reachable or gone; the 60s budget belongs to the *model*, not to the
+    // TCP handshake. A stuck connect here once held an intake slot for 10.5s.
+    this.connectProbeMs = connectProbeMs;
+    this.probe = dependencyProbe;
     this.calls = 0;
   }
 
@@ -182,6 +188,16 @@ export class BrokerLlmClient {
     this.calls += 1;
     const started = Date.now();
     let res;
+    if (this.connectProbeMs > 0) {
+      try {
+        await this.probe({ baseUrl: this.brokerUrl, timeoutMs: this.connectProbeMs });
+      } catch (err) {
+        // No status on the error: `llmFailureMessage` keeps its existing fail-closed
+        // wording ("我现在连不上模型…"), and the audit says which half is down.
+        this.audit.emit('llm.call', { result: 'error', reason: 'connect-fastfail', model: this.model, call: this.calls, ms: Date.now() - started, message: String(err.message).slice(0, 120) });
+        throw Object.assign(new Error('llm: broker unreachable (connect probe failed)'), { reason: 'connect-fastfail' });
+      }
+    }
     try {
       res = await this.fetch(`${this.brokerUrl}/v1/llm/chat/completions`, {
         method: 'POST',
