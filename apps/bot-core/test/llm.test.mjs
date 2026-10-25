@@ -141,10 +141,25 @@ test('the approved continuation writes exactly the pending arguments, with a one
   assert.equal(memory.writes.length, 1);
   assert.match(memory.writes[0].args.approvalId, /^appr-[0-9a-f]{32}$/);
   assert.equal(memory.writes[0].args.body, '主人喜欢香菜');
+  // The service keys a non-global preference by (subject, scope, scope_peer, pref_key) and
+  // refuses the write without a peer — the first live companion write died here, *after*
+  // the owner had approved. The peer comes from the bound principal.
+  assert.equal(memory.writes[0].args.scope, 'dm');
+  assert.equal(memory.writes[0].args.scopePeer, 'onebot:1035376945');
+  assert.equal(memory.writes[0].args.scopePeer, `${OWNER.channel}:${OWNER.chatId}`);
   // and the pending is gone: a second "同意" approves nothing further
   const again = await l.resolvePending({ text: '同意', principal: OWNER });
   assert.equal(again.orphan, true);
   assert.equal(memory.writes.length, 1);
+});
+
+test('a global preference is written without a peer, so it is not hidden from other chats', async () => {
+  const { loop: l, memory } = loop({ script: [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'preference', body: '主人对花生过敏', scope: 'global' })] });
+  await l.turn({ text: '记住我花生过敏', principal: OWNER });
+  await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(memory.writes.length, 1);
+  assert.equal(memory.writes[0].args.scope, 'global');
+  assert.equal(memory.writes[0].args.scopePeer, undefined, 'global scope must not carry a peer');
 });
 
 test('a bare 同意 with nothing pending is a no-op that writes nothing', async () => {

@@ -273,13 +273,21 @@ export function createMemoryTools(deps) {
       async execute(args, exec) {
         const principal = currentPrincipal();
         const approvalId = await approve({ toolName: 'memory_write', exec, args, note: cfg.approvalNote });
+        const scope = args.scope || 'dm';
         const res = await memory().write(
           {
             subjectKey: String(args.subjectKey),
             class: String(args.class),
             body: String(args.body).slice(0, 2000),
             attrKey: args.attrKey,
-            scope: args.scope || 'dm',
+            scope,
+            // `user_preference` is keyed by (subject, scope, scope_peer, pref_key), and a
+            // non-global scope without a peer is refused by the service - which is exactly
+            // how the first live companion write died *after* the owner had approved it.
+            // The peer is taken from the bound principal, never from the model: an
+            // LLM-supplied `scopePeer` would let one conversation publish a preference
+            // into another one's view.
+            ...(scope === 'global' ? {} : { scopePeer: `${principal.channel}:${principal.chatId}` }),
             approvalId,
           },
           principal,
