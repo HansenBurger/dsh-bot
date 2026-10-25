@@ -248,6 +248,22 @@ export class CompanionLoop {
   }
 
   /**
+   * Replace the "本轮未执行" placeholder the deferral left in the stored history with how the
+   * conversation actually ended. Without this the next turn still reads as if the owner had
+   * not answered, and the companion refuses to recall a fact it had just been handed.
+   */
+  settlePendingCall(key, callId, text) {
+    if (!callId) return false;
+    const messages = this.history.get(key) || [];
+    const at = messages.findIndex((m) => m.role === 'tool' && m.tool_call_id === callId);
+    if (at < 0) return false;
+    const next = messages.slice();
+    next[at] = { ...next[at], content: envelope('tool-outcome', text) };
+    this.history.set(key, next);
+    return true;
+  }
+
+  /**
    * @param {{text: string, principal: object}} input
    * @returns {Promise<{reply: string, pending: boolean, calls: number, error?: string}>}
    */
@@ -271,9 +287,19 @@ export class CompanionLoop {
         this.remember(key, messages);
         return { reply, pending: false, calls: this.llm.calls - callsBefore };
       }
-      for (const call of callList) {
+      for (let i = 0; i < callList.length; i += 1) {
+        const call = callList[i];
         const outcome = await this.runTool(call, principal);
         if (outcome.deferred) {
+          // Every tool_call in the assistant message we just stored needs a tool message
+          // back, or the provider rejects the *next* turn of this conversation with
+          // 400 "An assistant message with 'tool_calls' must be followed by tool messages
+          // responding to each 'tool_call_id'". Approval defers mid-list, so the deferred
+          // call and all the ones behind it get an honest placeholder: nothing ran yet.
+          for (const rest of callList.slice(i)) {
+            messages.push({ role: 'tool', tool_call_id: rest.id, content: envelope('tool-pending', '等待主人在私聊里确认，本轮未执行。') });
+          }
+          if (outcome.pending) outcome.pending.historyKey = key;
           this.remember(key, messages);
           return { reply: outcome.question, pending: true, calls: this.llm.calls - callsBefore };
         }
@@ -305,7 +331,10 @@ export class CompanionLoop {
     } catch (err) {
       if (err instanceof ApprovalDeferred) {
         const p = err.pending;
-        return { deferred: true, question: `${p.note}\n（回复「同意」写入，「拒绝」放弃；${Math.round(this.approvals.ttlMs / 60000)} 分钟内不作答自动失效）\n要记的是：${p.toolName === 'memory_write' ? String(p.args.body ?? '').slice(0, 200) : p.toolName}` };
+        // The queue learns which model call it is holding up, so the history entry can be
+        // settled when the owner answers (see settlePendingCall).
+        p.callId = call.id;
+        return { deferred: true, pending: p, question: `${p.note}\n（回复「同意」写入，「拒绝」放弃；${Math.round(this.approvals.ttlMs / 60000)} 分钟内不作答自动失效）\n要记的是：${p.toolName === 'memory_write' ? String(p.args.body ?? '').slice(0, 200) : p.toolName}` };
       }
       return { text: envelope('tool-error', String(err.message || 'tool failed').slice(0, 300)), deferred: false };
     }
@@ -328,16 +357,19 @@ export class CompanionLoop {
     }
     if (decision === 'denied') {
       this.approvals.take(key, 'denied');
+      this.settlePendingCall(pending.historyKey, pending.callId, '主人拒绝了这条操作，没有执行。');
       return { reply: '好，这条没有写入记忆。', calls: 0, denied: true };
     }
     if (pending.principal.userId !== principal.userId || pending.principal.channel !== principal.channel) {
       this.approvals.take(key, 'denied');
+      this.settlePendingCall(pending.historyKey, pending.callId, '这条确认不是发给当前会话的，没有执行。');
       this.audit.emit('approval.outcome', { stage: 'decided', approvalId: pending.id, result: 'denied', reason: 'principal-mismatch', chatKey: key });
       return { reply: '这条确认不是发给你的，我没有执行。', calls: 0, denied: true };
     }
     const tool = this.byName.get(pending.toolName);
     if (!tool) {
       this.approvals.take(key, 'denied');
+      this.settlePendingCall(pending.historyKey, pending.callId, '那个操作已不再支持，没有执行。');
       return { reply: '那个操作我不再支持，没有执行。', calls: 0, denied: true };
     }
     if (this.bindPrincipal) this.bindPrincipal(principal);
@@ -348,9 +380,11 @@ export class CompanionLoop {
       // on this path the decision already happened, so the queue hands out the token.
       const out = await tool.execute(pending.args, { name: pending.toolName, args: pending.args, approvalId });
       const text = String(out?.text ?? '已处理。');
+      this.settlePendingCall(pending.historyKey, pending.callId, `主人已同意，这一步已经执行（memoryId=${out?.memoryId ?? '未知'}）。`);
       this.audit.emit('approval.outcome', { stage: 'applied', result: 'allowed', approvalId: pending.id, toolName: pending.toolName, chatKey: key, memoryId: out?.memoryId ?? null, deduped: Boolean(out?.deduped) });
       return { reply: text, calls: 0, applied: true, memoryId: out?.memoryId ?? null };
     } catch (err) {
+      this.settlePendingCall(pending.historyKey, pending.callId, `主人已同意，但这一步执行失败：${shortReason(err)}。没有写入。`);
       this.audit.emit('approval.outcome', { stage: 'applied', result: 'error', approvalId: pending.id, toolName: pending.toolName, chatKey: key, reason: String(err.message).slice(0, 160) });
       return { reply: `写入失败了：${shortReason(err)}。`, calls: 0, error: err.message };
     }

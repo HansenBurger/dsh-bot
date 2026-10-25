@@ -133,6 +133,55 @@ test('memory_write defers to the owner instead of writing on the model’s say-s
   assert.match(out.reply, /主人喜欢香菜/);
 });
 
+test('a deferred approval leaves a provider-valid history for the next turn', async () => {
+  // Live failure (real QQ, 2026-10-25 11:32): after the approval question, the *following*
+  // message died with upstream 400 "An assistant message with 'tool_calls' must be followed
+  // by tool messages responding to each 'tool_call_id' (insufficient tool messages followed
+  // the tool_calls message)" - the deferred turn stored an assistant message whose calls were
+  // never answered, and the whole conversation was poisoned until the process restarted.
+  const script = [
+    toolCall('memory_search', { query: '香菜' }, 'c1'),
+    toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'preference', body: '主人喜欢香菜' }, 'c2'),
+    { role: 'assistant', content: '你喜欢香菜。', finish_reason: 'stop' },
+  ];
+  const { loop: l, memory } = loop({ script });
+  const first = await l.turn({ text: '我喜欢什么，顺便记住我喜欢香菜', principal: OWNER });
+  assert.equal(first.pending, true, 'the write part defers');
+  assert.equal(memory.writes.length, 0);
+  assert.equal(memory.searches.length, 1, 'the read-only call before it did run');
+  assertAnsweredToolCalls(l.llm.seen[0].messages, 'turn 1 request');
+
+  const decided = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(decided.applied, true);
+  assert.equal(memory.writes.length, 1);
+
+  const second = await l.turn({ text: '我喜欢什么', principal: OWNER });
+  assert.equal(second.reply, '你喜欢香菜。');
+  assert.equal(second.error, undefined, 'the follow-up turn must not fail on history shape');
+  // every request the loop has ever sent is well-formed, not just the stored history
+  for (const seen of l.llm.seen) assertAnsweredToolCalls(seen.messages, 'request');
+  const carried = l.llm.seen[2].messages;
+  const settled = carried.find((m) => m.role === 'tool' && m.tool_call_id === 'c2');
+  assert.ok(settled, 'the deferred call must still be answered in the replayed history');
+  assert.match(settled.content, /主人已同意/, 'the history must record how the deferral ended');
+  assert.doesNotMatch(settled.content, /等待主人/, 'otherwise the next turn still thinks it is waiting');
+});
+
+/** The invariant the provider enforces: each assistant tool_calls message is followed,
+ *  before the next assistant message, by one tool message per call id. */
+function assertAnsweredToolCalls(messages, label) {
+  for (let i = 0; i < messages.length; i += 1) {
+    const m = messages[i];
+    if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
+    const need = new Set(m.tool_calls.map((c) => c.id));
+    for (let j = i + 1; j < messages.length && need.size; j += 1) {
+      if (messages[j].role === 'assistant') break;
+      if (messages[j].role === 'tool' && need.has(messages[j].tool_call_id)) need.delete(messages[j].tool_call_id);
+    }
+    assert.equal(need.size, 0, `${label}: unanswered tool_calls ${[...need]} would be rejected with 400`);
+  }
+}
+
 test('the approved continuation writes exactly the pending arguments, with a one-time token', async () => {
   const { loop: l, memory } = loop({ script: [toolCall('memory_write', { subjectKey: 'onebot:dm:1035376945', class: 'preference', body: '主人喜欢香菜' })] });
   await l.turn({ text: '记住我喜欢香菜', principal: OWNER });
