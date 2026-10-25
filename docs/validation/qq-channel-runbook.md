@@ -331,11 +331,9 @@ bot-core 在 11:49 与 11:57 各重建一次（`llm.ready` model=deepseek-flash�
 `select count(*) … subject_key='qq:dm:900000002'` = **0 行**：过期即作废，迟到的批准不写。
 
 **模型人格与配额**：`deepseek-flash` 被上游接受（`GET /v1/llm/models` 返回
-`deepseek-flash = DeepSeek-V4.1-Flash`），单轮 `prompt_tokens≈1038`（两份 system prompt +
-四个工具 schema），`llm.egress ms` 111–134。到 11:50 为止上游共 **7 次请求**：5 次成功
-（models 1 + 打通用 1 + companion 轮 3，其中含真号那一次写入）+ 2 次被 400 拒绝（未产出 token，
-见上一节）；另有一次代理停机导致的失败（请求未达上游）。预算口径 ≤8，剩余按 3 次计。
-诊断这 2 次 400 没有再花配额：复现靠脚本化的假模型（单测），通路是否健康由这 2 次 400 本身证明。
+`deepseek-flash = DeepSeek-V4.1-Flash`），首轮 `prompt_tokens≈1032–1038`（两份 system prompt +
+四个工具 schema），带工具结果续轮涨到 1302 / 1679；`llm.egress ms` 111–139，整轮端到端 3.0 s
+（一次消息、三次上游）。配额终值见本节末尾的账本。
 
 **非白名单回归**：`scripts/ingress-e2e.mjs`（isolated，13/13）里 `W2a 非白名单用户收不到回复 —
 api calls=0` + `W2b reason=not-whitelisted` + `W4 文本自称主人不改判决 — api calls=0` 全绿；
@@ -393,11 +391,15 @@ companion.user_preference: subject_key onebot:dm:1035376945 / scope dm / scope_p
 `approval_id appr-cleanup-1a171599710`）+ access log 89 `delete/allowed`。清完复跑检索：
 「测试代号」0 行、「喜欢」1 行，库里剩下的唯一一行就是真号那条 `food.like`。
 
-**配额账本（口径：产出 token 的推理调用）**：真号召回这轮花 3 次（12:34:26 一条消息让模型连开两轮
-工具，第三轮才收口），累计 **8 次产出 token 的推理调用**（models 列表 1 次零消耗、代理停机 1 次未达
-上游、上游 400 2 次零消耗，都不在这口径里），到 12:34 之后**不再有任何自发起的调用**。
-按上游请求计数则是 8 请求 = 5×200(chat) + 2×400 + models 1；两个口径都在 `logs/broker.jsonl`
-/`logs/agent.jsonl` 里可复核。
+**配额账本（口径：产出 token 的推理调用，上限 8）**：终值 **8/8 用满**，12:34 之后不再有任何
+自发起的调用。逐项：`GET /v1/llm/models` 1 次（零 completion，不计）；手工 curl 打通 1 次（16
+completion token）；合成号 companion 轮 3 次（prompt/completion = 1032/250、1038/153、1038/269）；
+真号「记住我喜欢香菜」1 次（1033/173）；真号「我喜欢什么」**3** 次（1032/177、1302/132、1679/37
+——模型连开两轮工具、每轮两个 `memory_search`，第三轮才收口，比预估多 1 次）。另有 2 条
+`status:400`（未产 token，不计）与 1 次代理停机（请求未达上游，不计）。按**上游请求数**算是 12
+= 8×200(chat) + 2×400 + models 1 + 停机 1；两个口径都能在 `logs/broker.jsonl` / `logs/agent.jsonl`
+里复核，以产出 token 者为本任务的记账口径。诊断那 2 次 400 没有额外花配额：复现靠脚本化假模型的
+单测，通路是否健康由那两次 400 本身证明。
 
 ## 4. Telegram：明确 deferred（不在本任务范围）
 
