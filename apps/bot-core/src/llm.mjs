@@ -159,6 +159,7 @@ export class ApprovalQueue {
     this.audit.emit('approval.outcome', { stage: 'decided', approvalId: pending.id, toolName: pending.toolName, chatKey: key, decision, waitedMs: this.now() - pending.createdAt });
     return pending;
   }
+
 }
 
 /**
@@ -380,9 +381,17 @@ export class CompanionLoop {
           for (const rest of callList.slice(i)) {
             messages.push({ role: 'tool', tool_call_id: rest.id, content: envelope('tool-pending', '等待主人在私聊里确认，本轮未执行。') });
           }
+          // T9-F1: the batch does not end here. The owner approves one entry at a time
+          // (one pending per conversation is deliberate — "同意" must never be ambiguous),
+          // so the *rest* of this message's writes must be re-raised in later turns. The
+          // reply says so explicitly: half a message remembered is not "all remembered".
+          const restWrites = callList.slice(i + 1).filter((c) => c.function?.name === 'memory_write').length;
+          const restNote = restWrites > 0
+            ? `\n（同一条消息里还有 ${restWrites} 条写入没轮到确认，稍后会逐条再问你，不会假装已经全记住。）`
+            : '';
           if (outcome.pending) outcome.pending.historyKey = key;
           this.remember(key, messages);
-          return { reply: outcome.question, pending: true, calls: this.llm.calls - callsBefore };
+          return { reply: outcome.question + restNote, pending: true, calls: this.llm.calls - callsBefore };
         }
         messages.push({ role: 'tool', tool_call_id: call.id, content: outcome.text });
       }

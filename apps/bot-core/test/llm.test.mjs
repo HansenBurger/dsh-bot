@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AuditSink } from '@dsh-bot/bot-audit';
 import { approvalWord, ApprovalQueue, BrokerLlmClient, CHAT_DATA_PROMPT, CompanionLoop, llmFailureMessage, toToolSchema, wrapInboundChat } from '../src/llm.mjs';
+import { MEMORY_HANDLING_PROMPT } from '../src/index.mjs';
 
 const OWNER = Object.freeze({ channel: 'onebot', chatId: '1035376945', userId: '1035376945', role: 'owner', peerKind: 'dm' });
 const TRUSTED = Object.freeze({ channel: 'onebot', chatId: '222', userId: '222', role: 'trusted', peerKind: 'dm' });
@@ -494,5 +495,60 @@ test('R4: expiry settles the placeholder — history never claims "waiting" afte
   const next = await l.turn({ text: '我喜欢什么', principal: OWNER });
   assert.equal(next.error, undefined);
   for (const seen of llm.seen) assertAnsweredToolCalls(seen.messages, 'post-expiry request');
+});
+
+
+/* ---------------- T9-F1: multi-fact messages ---------------- */
+
+test('T9-F1: the memory-handling prompt pins one-fact-per-write and per-entry approval', () => {
+  // The t9 evidence was the model proposing ONE of two facts; the prompt never said
+  // what to do with several. These phrases are the contract the live check depends on.
+  assert.match(MEMORY_HANDLING_PROMPT, /一个事实一次 memory_write/);
+  assert.match(MEMORY_HANDLING_PROMPT, /逐条重新发起/);
+  assert.match(MEMORY_HANDLING_PROMPT, /绝不把两个事实塞进同一条 body/);
+  assert.match(MEMORY_HANDLING_PROMPT, /绝不[在]?回复里声称|回复里绝不声称/);
+});
+
+test('T9-F1: two writes in one message — approval is one-at-a-time, the tail is re-raised, both land', async () => {
+  const w = (body, attrKey) => ({ subjectKey: 'onebot:dm:1035376945', class: 'profile', body, attrKey });
+  const script = [
+    multiCall([['c1', 'memory_write', w('主人测试代号 B-77', 'code.test')], ['c2', 'memory_write', w('主人喜欢吃蓝莓酸奶', 'diet.fav')]]),
+    // prompt rule 4: the not-yet-approved tail comes back in a later turn.
+    multiCall([['c3', 'memory_write', w('主人喜欢吃蓝莓酸奶', 'diet.fav')]]),
+    { role: 'assistant', content: '两条都记下了。', finish_reason: 'stop' },
+  ];
+  const { loop: l, memory } = loop({ script });
+
+  const first = await l.turn({ text: '记住两件事：我的测试代号是 B-77，还有我喜欢吃蓝莓酸奶', principal: OWNER });
+  assert.equal(first.pending, true);
+  assert.match(first.reply, /要记的是：主人测试代号 B-77/);
+  assert.match(first.reply, /还有 1 条写入没轮到确认/);
+  assert.doesNotMatch(first.reply, /都记住了/);
+  assert.equal(l.approvals.byChat.size, 1, 'one pending per conversation — "同意" must stay unambiguous');
+  assert.equal(memory.writes.length, 0, 'nothing durable before the owner answers');
+  for (const seen of l.llm.seen) assertAnsweredToolCalls(seen.messages, 'F1 deferral round');
+
+  const applied1 = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(applied1.applied, true);
+  assert.equal(memory.writes.length, 1);
+  assert.match(memory.writes[0].args.body, /B-77/);
+  const hist = l.history.get(l.historyKey(OWNER));
+  const toolOf = (id) => hist.find((m) => m.role === 'tool' && m.tool_call_id === id);
+  assert.match(toolOf('c1').content, /已经执行/);
+  assert.match(toolOf('c2').content, /本轮未执行/, 'c2 was never approved — its placeholder must stay honest');
+
+  // the tail re-enters the loop and gets its OWN approval round; the owner answers again.
+  const second = await l.turn({ text: '都记全了吗', principal: OWNER });
+  assert.equal(second.pending, true);
+  assert.match(second.reply, /蓝莓酸奶/);
+  assert.doesNotMatch(second.reply, /没轮到确认/, 'this batch has nothing behind the deferred call');
+  const applied2 = await l.resolvePending({ text: '同意', principal: OWNER });
+  assert.equal(applied2.applied, true);
+  assert.equal(memory.writes.length, 2);
+  assert.match(memory.writes[1].args.body, /蓝莓酸奶/);
+
+  const done = await l.turn({ text: '现在都记住了吗', principal: OWNER });
+  assert.equal(done.reply, '两条都记下了。');
+  for (const seen of l.llm.seen) assertAnsweredToolCalls(seen.messages, 'F1 replay');
 });
 
