@@ -73,8 +73,15 @@ services:
       TG_BOT_TOKEN_REF: opaque-ref:ingress-tg-token
       TG_POLL: "off" # enable once a TG token is mounted; long-poll is out-bound only (C6)
       GATEWAY_ADMIN_PORT: "8181"
+      # F2 delivery leg (DEV-19): relay watcher-authored alert files to the owner over the
+      # existing send_private_msg return path. Unset ⇒ the relay is inert.
+      ALERT_QUEUE_DIR: /state/alerts
+      ALERT_OWNER_QQ: ${OWNER_QQ:-1035376945}
     volumes:
       - ../state:/state:ro # read-only consumer of the halt flag
+      # …except the watcher's alert queue, which this side must drain (move pending → sent).
+      # One sub-directory of the same bind, so the fail-closed flag stays read-only here.
+      - ../state/alerts:/state/alerts
       - ../logs:/var/log/dshbot
       - ./secrets/mem-hmac-secret:/run/secrets/mem-hmac-secret:ro
       - ./secrets/ingress-tg-token:/run/secrets/ingress-tg-token:ro
@@ -291,18 +298,52 @@ services:
 
   # Watchdog (E2/E3/E7): writes ./state/degraded, reads the audit stream. Deliberately
   # outside the protected containers, and built from ops/watcher when implemented (S3).
+  # t11 implemented it — `build: ./ops/watcher` used to point at a directory that did not
+  # exist, which is exactly why E3/F2/E7 (DEV-19) had no trigger side and `--profile ops`
+  # could not build at all.
   watcher:
     <<: *hardened
     profiles: ["ops"]
-    build: ./ops/watcher
-    networks: [net-ops]
+    build:
+      context: ..   # the repo root, like every other service in this file
+      dockerfile: ops/watcher/Dockerfile
+    image: dshbot-watcher:local
+    init: true
+    networks:
+      net-ops: { ipv4_address: 172.28.3.60 }
     environment:
       TG_BOT_TOKEN: ${TG_BOT_TOKEN_ALERT:-}
       OWNER_CHAT_ID: ${OWNER_CHAT_ID:-}
       ALIVE_HEARTBEAT_MIN: "5"
+      # What it can actually reach from net-ops. The probes are TCP-only on purpose: every
+      # container's /healthz binds 172.0.0.1 *inside itself* (C1), and an HTTP request to
+      # the broker's service port would append `credential.resolve result=denied`, i.e.
+      # trip this watcher's own E3 signal 1 and make the watchdog an incident generator.
+      WATCHER_TARGETS: ${WATCHER_TARGETS:-broker=tcp://172.28.3.30:8080:required,memory=http://172.28.3.50:8091/healthz:required,proxy=tcp://172.28.3.40:3128:optional}
+      WATCHER_INTERVAL_S: "10"
+      WATCHER_FAIL_THRESHOLD: "3"
+      WATCHER_CLOSE_THRESHOLD: "3"
+      WATCHER_LOG_DIR: /var/log/dshbot
+      DEGRADED_FLAG_PATH: /state/degraded
+      # DEV-05: TG is deferred and QQ is the only channel — but the send_private_msg path
+      # lives in the gateway's reverse-WS, and there is no OB11 HTTP endpoint reachable
+      # from net-ops, so alerts land in state/alerts.jsonl + `docker logs` until an
+      # approved delivery leg exists. Setting WATCHER_ALERT_DRY_RUN=0 is what would
+      # actually message the owner, and needs a sign-off first (docs/validation/ops-watcher.md §5).
+      WATCHER_ALERT_DRY_RUN: ${WATCHER_ALERT_DRY_RUN:-1}
+      WATCHER_QQ_ALERT_URL: ${WATCHER_QQ_ALERT_URL:-}
+      WATCHER_QQ_ALERT_TOKEN_REF: ${WATCHER_QQ_ALERT_TOKEN_REF:-}
+      WATCHER_QQ_ALERT_USER: ${OWNER_QQ:-1035376945}
     volumes:
       - ../logs:/var/log/dshbot:ro
       - ../state:/state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8186/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 4s
+      start_period: 15s
+      retries: 3
+    logging: *logging
 
   # ───────── L1 协议区（不可审计第三方代码，公理 3） ─────────
   napcat:

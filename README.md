@@ -217,4 +217,6 @@ scripts/               集成与端到端验证脚本
   建议后续轮换 `NAPCAT_WEBUI_TOKEN`。
 * **NapCat 会把 WebUI token 明文写进容器日志**（上游行为，不改镜像无法关闭），因此
   `docker compose logs napcat` 属敏感输出；t3 时再评估是否要做日志脱敏。
-* `--profile ops` 的 watcher/collector 目前是最小实现，只做降级旗标与心跳读取。
+* `--profile ops` 的 watcher 自 t11 起是**真实现**：依赖健康轮询 + 审计流规则 → 自动写
+  `state/degraded`（E3）+ 旁路告警（F2，经 gateway 的固定模板送达腿）+ 沉默告警（E7），
+  零 LLM token、不发布宿主端口。详见 `docs/validation/ops-watcher.md`；`collector` 仍是最小实现。

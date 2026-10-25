@@ -1,0 +1,12 @@
+{
+  "name": "@dsh-bot/ops-watcher",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "L6 运维区旁路 watcher (t3 §3 / arch §5.2): health polling, E3 auto circuit-break, F2 bypass alerting, E7 silence. Deliberately stdlib-only — the image installs nothing at runtime.",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/"
+  }
+}

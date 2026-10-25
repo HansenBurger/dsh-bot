@@ -191,6 +191,19 @@ export class Ob11Listener {
     return result;
   }
 
+  /**
+   * Proactive delivery to one user id (the watcher alert relay). Same action, same socket,
+   * same redaction responsibility as `send()` — the caller must pass already-sanitised
+   * fixed-template text, never queue contents.
+   */
+  async sendToUser(userId, text) {
+    if (!userId) return { ok: false, reason: 'no-owner-id-configured' };
+    const result = await this.call('send_private_msg', { user_id: Number(userId) || userId, message: [{ type: 'text', data: { text } }] });
+    if (result.ok) this.replies.sent += 1;
+    else this.replies.failed += 1;
+    return result.ok ? { ok: true } : { ok: false, error: result.error || `retcode:${result.retcode}` };
+  }
+
   connections() {
     return [...this.sockets.values()].map((e) => ({ socketId: e.socketId, selfId: e.selfId || null, readyState: e.ws.readyState, pending: e.pending.size }));
   }

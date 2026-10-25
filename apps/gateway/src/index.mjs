@@ -26,6 +26,7 @@ import { RateLimiter, Dedupe } from './ratelimit.mjs';
 import { Ob11Listener } from './ob11.mjs';
 import { TelegramAdapter } from './telegram.mjs';
 import { BotCoreSubmit } from './submit.mjs';
+import { AlertRelay } from './alert-relay.mjs';
 
 const REFUSAL_TEXT = '这条消息不在我的服务范围内。';
 // Decided once at boot: an unauthorised sender is refused, and how loudly is a product
@@ -71,6 +72,26 @@ export async function createGateway(opts = {}) {
   const dedupe = new Dedupe({ maxEntries: INT(env.DEDUPE_MAX_ENTRIES, 4096) });
   const degradedFlagPath = env.DEGRADED_FLAG_PATH || '/state/degraded';
   const submit = new BotCoreSubmit({ url: env.BOT_CORE_SUBMIT_URL || 'http://172.28.0.11:3005/submit', hmacSecret, audit });
+
+  // F2 delivery leg: the watcher cannot speak to QQ (it lives on net-ops and owns no
+  // adapter socket), so it drops structured alert files here and this relay turns them
+  // into one fixed-template `send_private_msg` per alert. Inert when unconfigured.
+  const alertRelay = env.ALERT_QUEUE_DIR
+    ? new AlertRelay({
+        dir: env.ALERT_QUEUE_DIR,
+        ownerUserId: env.ALERT_OWNER_QQ || env.OWNER_QQ || '',
+        audit,
+        intervalMs: Number(env.ALERT_RELAY_INTERVAL_MS || 10000),
+        cooldownMs: Number(env.ALERT_RELAY_COOLDOWN_MS || 300000),
+        maxQueue: Number(env.ALERT_RELAY_MAX_QUEUE || 20),
+        send: async (text) => {
+          if (!ob11) return { ok: false, error: 'no-adapter-yet' };
+          const result = await ob11.sendToUser(env.ALERT_OWNER_QQ || env.OWNER_QQ, text);
+          return result.ok ? { ok: true } : { ok: false, error: String(result.error || result.reason || 'send-failed') };
+        },
+        log: LOG,
+      })
+    : null;
 
   const refuseReply = env.REFUSE_REPLY === 'polite' ? 'polite' : 'silent';
   const state = { startedAt: Date.now(), gate: { allowed: 0, refused: 0, deduped: 0, throttled: 0, degraded: 0 }, refuseReply };
@@ -189,6 +210,7 @@ export async function createGateway(opts = {}) {
       gate: state.gate,
       dedupe: dedupe.seen.stats(),
       adapters: { ob11: ob11 ? { connections: ob11.connections(), replies: ob11.replies } : null, telegram: tg ? tg.stats : null },
+      alerts: alertRelay ? alertRelay.state() : null,
       degraded: isDegraded(),
       uptimeSeconds: Math.round((Date.now() - state.startedAt) / 1000),
     });
@@ -200,9 +222,15 @@ export async function createGateway(opts = {}) {
     healthServer.listen(INT(env.GATEWAY_ADMIN_PORT, 8181), '127.0.0.1', resolve);
   });
 
+  if (alertRelay) {
+    alertRelay.start();
+    LOG({ type: 'session.lifecycle', event: 'alert-relay-started', dir: env.ALERT_QUEUE_DIR, owner: Boolean(env.ALERT_OWNER_QQ || env.OWNER_QQ) });
+  }
+
   return {
     audit,
     policy,
+    alertRelay,
     limiter,
     dedupe,
     submit,
@@ -212,6 +240,7 @@ export async function createGateway(opts = {}) {
     state,
     handleMessage,
     close: async () => {
+      alertRelay?.stop();
       tg?.stop();
       if (ob11) await ob11.stop();
       await new Promise((r) => healthServer.close(r));
