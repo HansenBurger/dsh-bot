@@ -44,6 +44,11 @@ export const AUDIT_TYPES = Object.freeze([
   // generic message events — and quota/latency forensics depend on grepping them out.
   'llm.call',
   'agent.turn',
+  // The broker's own record of a tunneled upstream call. It was left out when the CONNECT
+  // tunnel landed, so every model call — including the fail-closed `result:"error"` ones
+  // that prove C5 held — was written as `external.message`, and an operator grepping the
+  // egress trail for `llm.egress` found nothing at all.
+  'llm.egress',
 ]);
 
 const MAX_PREVIEW_CHARS = 200;

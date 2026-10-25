@@ -158,6 +158,13 @@ test('broker: a protocol-relative path cannot aim the tunnel at another host (SS
   const denied = lines.find((l) => l.type === 'sandbox.denied' && l.reason === 'upstream-host-mismatch');
   assert.equal(denied.stage, 'llm-egress');
   assert.equal(denied.targetHost, 'attacker.example');
+  // The forwarded call has to stay greppable as its own event class: `emit()` relabels
+  // anything missing from AUDIT_TYPES as `external.message`, which is exactly how the
+  // egress trail went missing from the live log.
+  const forwarded = lines.find((l) => l.type === 'llm.egress');
+  assert.ok(forwarded, 'llm.egress must not be relabelled');
+  assert.equal(forwarded.status, 200);
+  assert.equal(lines.some((l) => l.type === 'external.message'), false, 'no egress event may degrade to external.message');
   assert.match(readFileSync(auditPath, 'utf8'), /"via":"direct"/);
   assert.doesNotMatch(readFileSync(auditPath, 'utf8'), new RegExp(LLM_KEY));
   assert.doesNotMatch(readFileSync(auditPath, 'utf8'), /smuggled/);
