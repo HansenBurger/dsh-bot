@@ -307,8 +307,18 @@ principal 推出（`${channel}:${chatId}`，与 `assertVisible` 的判定形状�
 真实结局——不改写的话模型下一轮仍然认为“还在等确认”，会答非所问。回归测试对修复前的源码会报
 `unanswered tool_calls c2 would be rejected with 400`，修复后 bot-core 37/37、`npm test` 166/166。
 
-遗留的措辞问题（未改）：任何 `chat()` 异常都回同一句「我现在连不上模型」，把上游 4xx（请求被拒）
-说成连接故障。审计里 `reason` 是对的，人看到的不是；留给后续任务，改法是把 4xx 与网络错误分开。
+措辞已分层（`619b452`）：`llmFailureMessage` 按 `err.status` 分流——没有 status（fetch 失败/超时，
+审计里是 `reason:"egress-failed"`）才说「连不上模型」；401/403 说凭据不对，429 说限流，≥500 说
+上游自己出错，其余 4xx 明说**这轮请求被模型拒了（不是连不上）**。上游错误正文只进审计，不进
+用户可见文本。
+
+bot-core 在 11:49 与 11:57 各重建一次（`llm.ready` model=deepseek-flash，healthy），会话历史与
+审批队列是进程内的，重启即清空——所以真号那条被毒化的历史已经不存在。
+
+**测试留下的行**：合成号写了一条 `subject_key='qq:dm:900000001'` / `attr_key=testing.codename`
+（「主人的测试代号是「橙子」。」）。它不会污染真号的召回——`assertVisible` 按
+`peer_key = ${channel}:${chatId}` 判定，真号是 `onebot:1035376945`。删除要走 `memory_forget`
+的主人审批（模型参与，要烧配额），本轮按预算不动它；清理属于后续任务。
 
 **超时 fail-closed**：合成号 `900000002` 发起「记住我的备用测试代号是蓝莓」后不作答，
 11:08 才回「同意」：
