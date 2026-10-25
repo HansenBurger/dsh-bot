@@ -1,0 +1,24 @@
+{
+  "name": "@dsh-bot/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ingress gateway: OneBot v11 reverse-WS listener, Telegram long-poll adapter, whitelist gate, rate limit, audit, HMAC submit hop",
+  "main": "src/index.mjs",
+  "bin": { "dshbot-gateway": "src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs"
+  },
+  "dependencies": {
+    "@dsh-bot/bot-audit": "*",
+    "@dsh-bot/bot-hmac": "*",
+    "@dsh-bot/bot-normalize": "*",
+    "@dsh-bot/bot-sanitize": "*",
+    "@dsh-bot/bot-secrets": "*",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

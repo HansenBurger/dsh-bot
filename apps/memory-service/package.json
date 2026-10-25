@@ -1,0 +1,16 @@
+{
+  "name": "@dsh-bot/memory-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Companion long-term memory service: Host PostgreSQL authority + SQLite L1 cache (t4 memory architecture).",
+  "main": "src/index.mjs",
+  "dependencies": {
+    "@dsh-bot/bot-audit": "*",
+    "@dsh-bot/bot-hmac": "*",
+    "@dsh-bot/bot-normalize": "*",
+    "@dsh-bot/bot-sanitize": "*",
+    "@dsh-bot/bot-secrets": "*",
+    "pg": "^8.16.3"
+  }
+}

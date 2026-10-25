@@ -1,0 +1,12 @@
+.git
+.agent-teams
+node_modules
+**/node_modules
+data
+logs
+state
+secrets
+docs
+scripts
+**/test
+*.md

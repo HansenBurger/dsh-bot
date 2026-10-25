@@ -1,0 +1,9 @@
+{
+  "name": "@dsh-bot/bot-sanitize",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared bot-sanitize primitives for the DSH big-fish companion prototype.",
+  "main": "src/index.mjs",
+  "exports": { ".": "./src/index.mjs" }
+}

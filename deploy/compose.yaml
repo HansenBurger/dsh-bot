@@ -1,0 +1,505 @@
+name: dsh-big-fish-bot
+
+# ---------------------------------------------------------------------------
+# S2' prototype stack (docs/design/t3-deployment-topology.md §3).
+#
+# Deviations from the reference compose, each one forced by something measurable:
+#
+#   1. **Four internal networks need four subnets.** t3 §3 references static
+#      addresses 172.28.0.10/.20/.30/.40/.50 as if one /24 covered every network;
+#      Docker requires a distinct subnet per bridge network, so the role numbering is
+#      preserved in the last octet and the third octet carries the zone:
+#        net-protocol 172.28.0.0/24, net-ingress 172.28.1.0/24,
+#        net-agent    172.28.2.0/24, net-ops     172.28.3.0/24.
+#      Static addresses are still used (t3 §3.1), so a reader of the design can map
+#      "…0.50 memory" onto "…2.50 memory" without re-deriving the topology.
+#   2. **PostgreSQL is reached over a mounted unix socket, not host.docker.internal.**
+#      The host instance listens on 127.0.0.1 only, and TCP from an internal bridge is
+#      measurably refused (ECONNREFUSED on both the docker gateway and loopback);
+#      putting the shared instance onto a bridge would violate C-1. See
+#      docs/validation/core-impl.md.
+#   3. **Third-party images are opt-in profiles** (`qq`, `llbot`, `egress`, `ops`,
+#      `agent`) because their digests are not pinned in this repository yet (t3 G1
+#      forbids `latest`) and because `docker compose up` must be verifiable without
+#      a QQ login or a provider key.
+# ---------------------------------------------------------------------------
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  restart: unless-stopped
+
+x-logging: &logging
+  # 10 MB x 3 per container: audit JSONL is written to the bind-mounted ./logs tree,
+  # while stdout stays bounded so a chatty adapter cannot fill the NAS volume (E7).
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  # ───────── L2 接入区：唯一下沉点 ─────────
+  ingress:
+    <<: *hardened
+    build:
+      context: ..   # relative to this file (deploy/), so the repo root
+      dockerfile: apps/gateway/Dockerfile
+    image: dshbot-ingress:local
+    init: true
+    networks:
+      net-protocol: { ipv4_address: 172.28.0.10 }
+      net-ingress: { ipv4_address: 172.28.1.10 }
+      net-edge: { ipv4_address: 172.28.4.10 } # the reverse-WS listener, see the deviation note
+    ports:
+      - "127.0.0.1:3001:3001" # C4: reverse-WS listener, host-local only
+    environment:
+      OB11_PORT: "3001"
+      OB11_BIND: 0.0.0.0
+      OB11_EXPECTED_SELF_ID: ${SELF_ID:?SELF_ID required (the bot's QQ number)}
+      # sha256(token) only — the token itself belongs to the protocol container (D1).
+      OB11_ACCESS_TOKEN_FINGERPRINT: ${TOKEN_FP:?TOKEN_FP required (sha256 of the OneBot access_token)}
+      RATE_SENDER_PER_MIN: "10" # E1
+      RATE_CHAT_PER_MIN: "30"
+      RATE_GLOBAL_PER_MIN: "60"
+      DEGRADED_FLAG_PATH: /state/degraded # E2/E3, written by the watcher
+      AUDIT_SINK: /var/log/dshbot/ingress.jsonl
+      SECRETS_DIR: /run/secrets
+      # No BROKER_URL here on purpose: t3 keeps the ingress container off net-secrets and
+      # net-memory, so its two credentials arrive as mounted files. Pointing it at the
+      # broker would only add a failed lookup (and a log line) to every start.
+      SUBMIT_HMAC_KEY_REF: opaque-ref:mem-hmac-secret
+      # SUB hop: ingress sends, bot-core receives (see the note in apps/bot-core/src/intake.mjs).
+      BOT_CORE_SUBMIT_URL: http://172.28.1.11:3005/submit
+      TG_BOT_TOKEN_REF: opaque-ref:ingress-tg-token
+      TG_POLL: "off" # enable once a TG token is mounted; long-poll is out-bound only (C6)
+      GATEWAY_ADMIN_PORT: "8181"
+      # F2 delivery leg (DEV-19): relay watcher-authored alert files to the owner over the
+      # existing send_private_msg return path. Unset ⇒ the relay is inert.
+      ALERT_QUEUE_DIR: /state/alerts
+      ALERT_OWNER_QQ: ${OWNER_QQ:-1035376945}
+    volumes:
+      - ../state:/state:ro # read-only consumer of the halt flag
+      # …except the watcher's alert queue, which this side must drain (move pending → sent).
+      # One sub-directory of the same bind, so the fail-closed flag stays read-only here.
+      - ../state/alerts:/state/alerts
+      - ../logs:/var/log/dshbot
+      - ./secrets/mem-hmac-secret:/run/secrets/mem-hmac-secret:ro
+      - ./secrets/ingress-tg-token:/run/secrets/ingress-tg-token:ro
+      - ./whitelist.json:/etc/dshbot/whitelist.json:ro
+    depends_on:
+      broker: { condition: service_started }
+      bot-core: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8181/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    logging: *logging
+
+  # ───────── L4 agent 区：SUB 接收端 + 记忆工具 ─────────
+  bot-core:
+    <<: *hardened
+    build:
+      context: ..   # relative to this file (deploy/), so the repo root
+      dockerfile: apps/bot-core/Dockerfile
+    image: dshbot-bot-core:local
+    init: true
+    user: "10001:10001" # B5: a different uid from NapCat (2100)
+    networks:
+      net-ingress: { ipv4_address: 172.28.1.11 }
+      net-agent: { ipv4_address: 172.28.2.11 }
+    # 3005 stays inside net-ingress: nothing on the host may submit frames (t3 §3).
+    environment:
+      SUBMIT_PORT: "3005"
+      SUBMIT_BIND: 0.0.0.0
+      MAX_CONCURRENT_RUNS: "2" # E1
+      DEP_CONNECT_PROBE_MS: ${DEP_CONNECT_PROBE_MS:-1500} # T9-F4: 依赖停机的连接层快速失败（broker/memory 共用拨号超时）
+      BOT_CORE_MODE: ${BOT_CORE_MODE:-queue}
+      AUDIT_SINK: /var/log/dshbot/agent.jsonl
+      AGENT_ADMIN_PORT: "8185"
+      MEMORY_SERVICE_URL: http://172.28.2.50:8091
+      SECRETS_DIR: /run/secrets
+      # No BROKER_URL here on purpose: t3 keeps the ingress container off net-secrets and
+      # net-memory, so its two credentials arrive as mounted files. Pointing it at the
+      # broker would only add a failed lookup (and a log line) to every start.
+      BOT_SUBMIT_HMAC_KEY_REF: opaque-ref:mem-hmac-secret
+      MEM_HMAC_SECRET_REF: opaque-ref:mem-hmac-secret
+      HOME: /run/user/10001 # axiom 2: credentials land in an ephemeral HOME
+      DSH_HOME: /home/bot/.dsh
+      HTTP_PROXY: http://172.28.3.40:3128 # C5 (only consulted when the egress profile is up)
+      HTTPS_PROXY: http://172.28.3.40:3128
+      NO_PROXY: 172.28.2.30,172.28.2.50,172.28.1.10
+      # D1: a ref, never a key. `BOT_CORE_MODE=llm` sends model traffic to the broker's
+      # /v1/llm egress proxy over net-agent (internal). The HMAC credentials still arrive as
+      # mounted files, so intake works with the broker down; only the model leg needs it.
+      # bot-core cannot resolve `llm-key` (broker NEVER_RESOLVE) and has no key mount.
+      DEEPSEEK_API_KEY: opaque-ref:${LLM_KEY_REF:-llm-key}
+      BROKER_URL: http://172.28.2.30:8080 # llm egress only
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash} # quota-sensitive default; deepseek-chat on request
+      APPROVAL_TTL_MS: ${APPROVAL_TTL_MS:-300000} # U3: 5 min with no answer -> nothing is written
+    volumes:
+      - ../data/dsh-home:/home/bot/.dsh
+      - work-rw:/rw/work # U2: disposable, tmpfs-backed
+      - ./profiles:/etc/dsh-profile:ro
+      - ../logs:/var/log/dshbot
+      - ./secrets/enroll-bot-core:/run/secrets/enrollment-token:ro
+      - ./secrets/mem-hmac-secret:/run/secrets/mem-hmac-secret:ro
+    tmpfs:
+      # /rw/work is NOT listed here: it is the `work-rw` named volume below, whose
+      # driver_opts already make it a size-capped tmpfs (512 M). Declaring both would be
+      # a compose error (same target twice), and the volume form is the one t3 §3 ships.
+      - /run:size=32m
+    depends_on:
+      broker: { condition: service_started }
+      memory: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8185/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    logging: *logging
+
+  # ───────── L6 数据区：长期记忆（PG）+ 短期缓存（SQLite） ─────────
+  memory:
+    <<: *hardened
+    build:
+      context: ..   # relative to this file (deploy/), so the repo root
+      dockerfile: apps/memory-service/Dockerfile
+    image: dshbot-memory:local
+    init: true
+    user: "10001:10001"
+    networks:
+      net-agent: { ipv4_address: 172.28.2.50 }
+      net-ops: { ipv4_address: 172.28.3.50 }
+    # No published ports at all: 8091 is the internal REST surface, 8190 is loopback
+    # admin inside the container (8090 is taken by a host service, hence 8091).
+    environment:
+      MEM_BIND: 0.0.0.0
+      MEM_INTERNAL_PORT: "8091"
+      MEM_ADMIN_PORT: "8190"
+      # `socket:` prefix → libpq connects over the mounted host socket directory.
+      MEM_PG_HOST: socket:/var/run/postgresql
+      MEM_PG_PORT: "5432"
+      MEM_PG_DATABASE: dsh_companion
+      MEM_PG_RW_PASSWORD_REF: opaque-ref:mem-pg-rw-password
+      MEM_PG_RO_PASSWORD_REF: opaque-ref:mem-pg-ro-password
+      MEM_KEK_REF: opaque-ref:mem-kek
+      MEM_HMAC_SECRET_REF: opaque-ref:mem-hmac-secret
+      # Opt-in: the container applies the schema itself through the provisioning role.
+      MEM_RUN_MIGRATIONS: ${MEM_RUN_MIGRATIONS:-0}
+      MEM_PG_PROVISIONING_REF: ${MEM_PG_PROVISIONING_REF:-}
+      MEM_PG_PROVISIONING_USER: dsh_companion_provision
+      SECRETS_DIR: /run/secrets
+      # No BROKER_URL here on purpose: t3 keeps the ingress container off net-secrets and
+      # net-memory, so its two credentials arrive as mounted files. Pointing it at the
+      # broker would only add a failed lookup (and a log line) to every start.
+      AUDIT_SINK: /var/log/dshbot/memory.jsonl
+      MEM_L1_PATH: /var/lib/dshbot/memory/l1.db
+      MEM_L1_TTL_HOURS: "24" # short-term memory horizon (t4 §2)
+      MEM_PG_POOL_MAX_PER_ROLE: "5" # 5 x 2 roles = 10, the agreed ceiling (t4 §9.4)
+      MEM_BACKUP_DIR: /var/lib/dshbot/memory/backup
+    volumes:
+      - memory-l1:/var/lib/dshbot/memory
+      - ../logs:/var/log/dshbot
+      - /var/run/postgresql:/var/run/postgresql # host PG unix socket (deviation 2)
+      - ./secrets/enroll-memory-service:/run/secrets/enrollment-token:ro
+      - ./secrets/mem-pg-rw-password:/run/secrets/mem-pg-rw-password:ro
+      - ./secrets/mem-pg-ro-password:/run/secrets/mem-pg-ro-password:ro
+      - ./secrets/mem-kek:/run/secrets/mem-kek:ro
+      - ./secrets/mem-hmac-secret:/run/secrets/mem-hmac-secret:ro
+    depends_on:
+      broker: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8190/healthz"]
+      interval: 10s
+      timeout: 4s
+      start_period: 20s
+      retries: 3
+    logging: *logging
+
+  # ───────── L5 机密与出站 ─────────
+  broker:
+    <<: *hardened
+    build:
+      context: ..   # relative to this file (deploy/), so the repo root
+      dockerfile: apps/secret-broker/Dockerfile
+    image: dshbot-broker:local
+    init: true
+    networks:
+      net-agent: { ipv4_address: 172.28.2.30 }
+      net-ops: { ipv4_address: 172.28.3.30 }
+    environment:
+      SECRETS_DIR: /run/secrets
+      BROKER_PORT: "8080"
+      BROKER_ADMIN_PORT: "8180"
+      LLM_UPSTREAM_BASE: ${LLM_UPSTREAM_BASE:-}
+      LLM_KEY_REF: llm-key
+      # The broker injects the provider key itself, so it is the one container that must
+      # reach the upstream - but it must get there *through* the C5 allowlist, not around
+      # it. Node's https ignores these variables, hence src/proxy-tunnel.mjs (CONNECT).
+      HTTPS_PROXY: http://172.28.3.40:3128
+      NO_PROXY: 172.28.0.0/16,127.0.0.1
+      AUDIT_SINK: /var/log/dshbot/broker.jsonl
+    volumes:
+      # The only plaintext-bearing mount in the stack, and the only container that can
+      # read it (D1). `deploy/secrets/` is git-ignored and 0700.
+      - ./secrets:/run/secrets:ro
+      - ../logs:/var/log/dshbot
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8180/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    logging: *logging
+
+  # Egress allowlist (C5). Behind a profile: the squid digest must be pinned by the
+  # operator before this becomes part of the default stack.
+  proxy:
+    <<: *hardened
+    profiles: ["egress"]
+    # t3 wrote `ubuntu/squid:6.10-2404.v1`, which has never existed upstream (same class of
+    # phantom reference as the NapCat tag). Real tags are `<ver>-<ubuntu>_beta|_edge`; the
+    # LTS pairing is squid 6.6 on 24.04. Digest-verified from two sources and pinned:
+    #   docker buildx imagetools inspect ubuntu/squid:6.6-24.04_beta
+    #   https://hub.docker.com/v2/repositories/ubuntu/squid/tags/6.6-24.04_beta  (2025-11-24)
+    image: ubuntu/squid:6.6-24.04_beta@sha256:8fafd41d6ddceb295d26eea9938321d825ac5351c7e46cf6a8aa5d093b8ed1ce
+    networks:
+      net-ops: { ipv4_address: 172.28.3.40 }
+      # The allowlist proxy has to have a route to filter *toward*. This is the only leg
+      # with masquerade enabled in the stack apart from net-qq (the Tencent login servers,
+      # which speak raw TCP/QUIC that squid cannot CONNECT). Nothing else is attached here,
+      # so the policy in rules.conf stays the single place destinations are decided.
+      net-egress: { ipv4_address: 172.28.5.40 }
+    read_only: true
+    # Like NapCat, this image drops its own privileges: squid starts as root and calls
+    # setgid/setuid to become `proxy` (uid 13), which a bare cap_drop:[ALL] container cannot
+    # do (`setgid: Operation not permitted`, then a crash loop). Grant exactly the
+    # privilege-dropping caps and nothing more, and pin the run user so the drop has a
+    # target. Recorded as a deviation next to the NapCat one.
+    user: "0:0"
+    cap_add: [SETUID, SETGID, DAC_OVERRIDE, CHOWN]
+    # squid needs writable spool/pid/log dirs under a read-only rootfs. The service-level
+    # tmpfs key replaces the anchor's list, so /tmp is repeated here (t7 lesson).
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run:size=16m,mode=1777
+      - /var/spool/squid:size=128m,mode=1777
+      - /var/log/squid:size=32m,mode=1777
+    volumes:
+      # `a01-` is load-bearing: squid reads conf.d/*.conf in filename order and the image's
+      # own debian.conf ends with `http_access allow localnet`, which covers 172.16.0.0/12 -
+      # every address in this stack. Under the old `dshbot-rules.conf` name the distro rule
+      # matched first and CONNECTs to non-allowlisted hosts were tunneled anyway.
+      - ./egress-proxy/rules.conf:/etc/squid/conf.d/a01-dshbot-rules.conf:ro
+      - ../logs:/var/log/dshbot
+    logging: *logging
+
+  # Watchdog (E2/E3/E7): writes ./state/degraded, reads the audit stream. Deliberately
+  # outside the protected containers, and built from ops/watcher when implemented (S3).
+  # t11 implemented it — `build: ./ops/watcher` used to point at a directory that did not
+  # exist, which is exactly why E3/F2/E7 (DEV-19) had no trigger side and `--profile ops`
+  # could not build at all.
+  watcher:
+    <<: *hardened
+    profiles: ["ops"]
+    build:
+      context: ..   # the repo root, like every other service in this file
+      dockerfile: ops/watcher/Dockerfile
+    image: dshbot-watcher:local
+    init: true
+    networks:
+      net-ops: { ipv4_address: 172.28.3.60 }
+    environment:
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN_ALERT:-}
+      OWNER_CHAT_ID: ${OWNER_CHAT_ID:-}
+      ALIVE_HEARTBEAT_MIN: "5"
+      # What it can actually reach from net-ops. The probes are TCP-only on purpose: every
+      # container's /healthz binds 172.0.0.1 *inside itself* (C1), and an HTTP request to
+      # the broker's service port would append `credential.resolve result=denied`, i.e.
+      # trip this watcher's own E3 signal 1 and make the watchdog an incident generator.
+      WATCHER_TARGETS: ${WATCHER_TARGETS:-broker=tcp://172.28.3.30:8080:required,memory=http://172.28.3.50:8091/healthz:required,proxy=tcp://172.28.3.40:3128:optional}
+      WATCHER_INTERVAL_S: "10"
+      WATCHER_FAIL_THRESHOLD: "3"
+      WATCHER_CLOSE_THRESHOLD: "3"
+      WATCHER_LOG_DIR: /var/log/dshbot
+      DEGRADED_FLAG_PATH: /state/degraded
+      # DEV-05: TG is deferred and QQ is the only channel — but the send_private_msg path
+      # lives in the gateway's reverse-WS, and there is no OB11 HTTP endpoint reachable
+      # from net-ops, so alerts land in state/alerts.jsonl + `docker logs` until an
+      # approved delivery leg exists. Setting WATCHER_ALERT_DRY_RUN=0 is what would
+      # actually message the owner, and needs a sign-off first (docs/validation/ops-watcher.md §5).
+      WATCHER_ALERT_DRY_RUN: ${WATCHER_ALERT_DRY_RUN:-1}
+      WATCHER_QQ_ALERT_URL: ${WATCHER_QQ_ALERT_URL:-}
+      WATCHER_QQ_ALERT_TOKEN_REF: ${WATCHER_QQ_ALERT_TOKEN_REF:-}
+      WATCHER_QQ_ALERT_USER: ${OWNER_QQ:-1035376945}
+    volumes:
+      - ../logs:/var/log/dshbot:ro
+      - ../state:/state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8186/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 4s
+      start_period: 15s
+      retries: 3
+    logging: *logging
+
+  # ───────── L1 协议区（不可审计第三方代码，公理 3） ─────────
+  napcat:
+    <<: *hardened
+    profiles: ["qq"]
+    # t3 G3: digest-pinned (unauditable third-party code holding the QQ session).
+    # Resolved 2026-10-24 from this host after the router-level proxy was enabled and
+    # cross-verified by two independent sources returning the identical digest:
+    #   docker buildx imagetools inspect (registry manifest list, OCI index)
+    #   hub.docker.com/v2 tag API (amd64+arm64, last pushed 2026-10-21)
+    # The former placeholder tag `0.01.11` does NOT exist in the repository; the real
+    # current tag is v4.18.41 (matches NapCat v4.18.41 from the t1 research).
+    image: mlikiowa/napcat-docker:v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e
+    # t3's "NapCat runs as uid 2100" is honoured by the image itself, not by compose:
+    # entrypoint.sh does `usermod -o -u $NAPCAT_UID napcat` + `chown -R` + `gosu napcat`,
+    # so it has to start as root. Forcing `user: "2100:2100"` here made it crash-loop —
+    # /app/NapCat.Shell.zip is mode 0600 root:root, and uid 2100 cannot even read the
+    # payload it is supposed to install. The drop still happens; `docker top` shows the
+    # app processes owned by 2100, which is a stronger claim than a compose directive.
+    # The four capabilities below are the minimum for usermod/groupmod/chown/gosu; they
+    # are granted only to this protocol container, never to the agent or memory planes.
+    user: "0:0"
+    cap_add: [CHOWN, FOWNER, SETUID, SETGID]
+    security_opt:
+      - "no-new-privileges:true"
+      # Docker resolves `seccomp=<path>` against the *daemon's* working directory, not the
+      # compose file, so a relative path could never work even if the file existed. The
+      # profile is supplied as an absolute path when available:
+      #   security_opt: ["no-new-privileges:true", "seccomp=/abs/deploy/seccomp/napcat.json"]
+      # Until then NapCat runs under Docker's default seccomp profile, which is still a
+      # deny-by-default syscall filter (not `unconfined`).
+    networks:
+      net-qq: {} # DEV-01: first entry -> carries the container's default route (masqueraded)
+      net-protocol: { ipv4_address: 172.28.0.20 }
+    ports:
+      # C1/C-16: loopback only (3081 avoids the host's 3080). This was briefly published on
+      # 0.0.0.0:3081 so a remote operator could reach the WebUI for the one-time QR login;
+      # reverted right after the login was adopted. The window is recorded in
+      # docs/validation/qq-channel-runbook.md, not left dangling in the manifest.
+      - "127.0.0.1:3081:6099"
+    environment:
+      MODE: reverse_ws # D-03: the protocol side dials us; the NAS listens to nothing new
+      # Without ACCOUNT the image starts QQ with no target account and always shows a fresh
+      # login QR, so a container recreate would silently cost us the session. entrypoint.sh
+      # passes `-q $ACCOUNT` when it is set, which is what makes the persisted credentials in
+      # ../data/qq usable. It follows SELF_ID so adoption does not need a second edit.
+      ACCOUNT: ${SELF_ID:?SELF_ID required (the bot's own QQ number)}
+      ONEBOT_URL: ws://172.28.0.10:3001/onebot/v11/ws
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
+      # Interpolated lazily (no `:?`) so `compose config` stays green while this profile
+      # is off; the README requires a >=32-byte random value before the profile is used.
+      WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:-}
+    # The image installs itself by unzipping /app/NapCat.Shell.zip into ./NapCat.Shell on
+    # first start, which a read-only rootfs refuses ("cannot create extraction directory").
+    # The scratch directory is a tmpfs instead of loosening the rootfs: it is wiped with the
+    # container, and the installed tree lands in ../data/napcat-app below. Declaring `tmpfs`
+    # here replaces the anchor's list, so /tmp is repeated rather than inherited.
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/NapCat.Shell:size=256m,mode=1777
+    volumes:
+      - ../data/qq:/app/.config/QQ
+      # The install target: entrypoint.sh unzips the payload into /app/napcat, which a
+      # read-only rootfs would refuse. One host directory holds the installed app *and*
+      # its config, so the login token survives recreation (that is what keeps the QR
+      # scan a one-time step).
+      - ../data/napcat-app:/app/napcat
+      # The image declares VOLUME /app/napcat/config, so without an explicit bind every
+      # recreate gets a fresh anonymous volume and the reverse-WS settings (url +
+      # access_token) would have to be redone by hand. Binding the host directory keeps
+      # them; the self-install above writes the templates into it on first run.
+      - ../data/napcat-config:/app/napcat/config
+      - ../data/napcat-plugins:/app/napcat/plugins:ro
+
+  llbot:
+    <<: *hardened
+    profiles: ["llbot"]
+    image: dshbot-llbot:local # self-built, digest pinned by the operator (G3)
+    networks:
+      net-protocol: { ipv4_address: 172.28.0.21 }
+      net-edge: { ipv4_address: 172.28.4.21 } # dials the published reverse-WS listener
+    ports:
+      - "127.0.0.1:3082:3080"
+    environment:
+      HTTP_MODE: headless
+
+  # The real DSH host GUI, once a provider credential exists (see docs/validation).
+  dsh:
+    <<: *hardened
+    profiles: ["agent"]
+    extends:
+      service: bot-core
+    image: dshbot-dsh:local
+    entrypoint: ["dsh", "--profile", "bot"]
+    command: ["headless"]
+    ports:
+      - "127.0.0.1:3080:3080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3080/"]
+      interval: 20s
+      timeout: 4s
+      start_period: 25s
+      retries: 3
+
+volumes:
+  memory-l1:
+  work-rw:
+    driver: local
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=536870912" } # U2: 512 MB, disposable
+
+networks:
+  # Deviation from t3 §4, measured and deliberate: Docker cannot publish a container port
+  # for a container attached only to `internal: true` networks — the binding silently
+  # stays absent (NetworkSettings.Ports was null while HostConfig.PortBindings said
+  # 127.0.0.1:3001). The adapter-facing listener therefore needs one non-internal link.
+  # It is kept harmless in two ways: IP masquerade is off, so nothing on this segment can
+  # reach the internet (egress still goes through the squid profile, as designed), and
+  # every published port on it defaults to the loopback address (C4).
+  net-edge:
+    name: bot-net-edge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+    ipam: { config: [{ subnet: 172.28.4.0/24 }] }
+  net-protocol:
+    name: bot-net-protocol
+    internal: true
+    ipam: { config: [{ subnet: 172.28.0.0/24 }] }
+  net-ingress:
+    name: bot-net-ingress
+    internal: true
+    ipam: { config: [{ subnet: 172.28.1.0/24 }] }
+  net-agent:
+    name: bot-net-agent
+    internal: true
+    ipam: { config: [{ subnet: 172.28.2.0/24 }] }
+  net-ops:
+    name: bot-net-ops
+    internal: true
+    ipam: { config: [{ subnet: 172.28.3.0/24 }] }
+  # DEV-01: the QQ protocol client is the one component that *must* reach the public
+  # internet (Tencent login/msf servers speak raw TCP/QUIC, which squid cannot CONNECT).
+  # It gets its own masqueraded bridge; no other service joins it, and the container still
+  # holds no secrets and cannot see the workspace (isolation stays container-level).
+  net-egress:
+    name: bot-net-egress
+    # The only leg in the stack with masquerade ON besides net-qq, and the only member is
+    # the allowlist proxy. Everything else stays internal-only and reaches the internet no
+    # other way, so rules.conf remains the single place destinations are decided (C5).
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+    ipam: { config: [{ subnet: 172.28.5.0/24 }] }
+  net-qq:
+    name: bot-net-qq
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "true"

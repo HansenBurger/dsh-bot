@@ -1,0 +1,20 @@
+{
+  "name": "@dsh-bot/secret-broker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Opaque-ref secret resolution + LLM egress proxy for the DSH companion",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": { "dshbot-secret-broker": "src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs && node --check src/policy.mjs"
+  },
+  "dependencies": {
+    "@dsh-bot/bot-audit": "*",
+    "@dsh-bot/bot-hmac": "*"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

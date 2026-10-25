@@ -1,0 +1,38 @@
+{
+  "name": "@dsh-bot/bot-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH extension skeleton: memory tools, approval interception, untrusted-content envelope, SUB intake listener",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./intake": "./src/intake.mjs",
+    "./memory-client": "./src/memory-client.mjs"
+  },
+  "scripts": {
+    "start": "node src/standalone.mjs",
+    "check": "node --check src/index.mjs"
+  },
+  "dependencies": {
+    "@dsh-bot/bot-audit": "*",
+    "@dsh-bot/bot-hmac": "*",
+    "@dsh-bot/bot-normalize": "*",
+    "@dsh-bot/bot-sanitize": "*",
+    "@dsh-bot/bot-secrets": "*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

@@ -1,12 +1,25 @@
 {
-  "name": "dsh-big-fish-bot-docs",
+  "name": "dsh-big-fish-bot",
   "private": true,
   "type": "module",
-  "description": "Design docs for the DSH big-fish chat companion; dev tooling is used only to verify Mermaid diagrams.",
+  "description": "DSH big-fish chat companion: design docs plus the S2' prototype (message gateway, memory service, secret broker, DSH plugin skeleton).",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "check:mermaid": "node scripts/check-mermaid.mjs"
+    "check:mermaid": "node scripts/check-mermaid.mjs",
+    "test": "node --test packages/bot-normalize/test/*.test.mjs packages/bot-hmac/test/*.test.mjs packages/bot-audit/test/*.test.mjs packages/bot-sanitize/test/*.test.mjs packages/bot-secrets/test/*.test.mjs apps/memory-service/test/*.test.mjs apps/gateway/test/*.test.mjs apps/bot-core/test/*.test.mjs apps/secret-broker/test/*.test.mjs ops/watcher/test/*.test.mjs",
+    "test:integration": "node scripts/integration-memory.mjs",
+    "up": "docker compose -f deploy/compose.yaml up -d",
+    "down": "docker compose -f deploy/compose.yaml down --remove-orphans",
+    "assert:listeners": "bash deploy/scripts/assert-listeners.sh",
+    "test:coverage": "node --test --experimental-test-coverage packages/bot-normalize/test/*.test.mjs packages/bot-hmac/test/*.test.mjs packages/bot-audit/test/*.test.mjs packages/bot-sanitize/test/*.test.mjs packages/bot-secrets/test/*.test.mjs apps/memory-service/test/*.test.mjs apps/gateway/test/*.test.mjs apps/bot-core/test/*.test.mjs apps/secret-broker/test/*.test.mjs ops/watcher/test/*.test.mjs",
+    "test:watcher": "node --test ops/watcher/test/*.test.mjs",
+    "watcher:up": "docker compose -f deploy/compose.yaml --profile ops up -d --build watcher"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
     "jsdom": "^26.0.0",
     "mermaid": "^11.17.2"
   }

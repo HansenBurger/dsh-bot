@@ -1,0 +1,12 @@
+{
+  "name": "@dsh-bot/bot-secrets",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.mjs",
+  "exports": { ".": "./src/index.mjs" },
+  "dependencies": {
+    "@dsh-bot/bot-hmac": "*"
+  },
+  "engines": { "node": ">=22.5.0" }
+}
