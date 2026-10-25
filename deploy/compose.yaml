@@ -122,7 +122,14 @@ services:
       HTTP_PROXY: http://172.28.3.40:3128 # C5 (only consulted when the egress profile is up)
       HTTPS_PROXY: http://172.28.3.40:3128
       NO_PROXY: 172.28.2.30,172.28.2.50,172.28.1.10
-      DEEPSEEK_API_KEY: opaque-ref:${LLM_KEY_REF:-llm-key} # D1: a ref, never a key
+      # D1: a ref, never a key. `BOT_CORE_MODE=llm` sends model traffic to the broker's
+      # /v1/llm egress proxy over net-agent (internal). The HMAC credentials still arrive as
+      # mounted files, so intake works with the broker down; only the model leg needs it.
+      # bot-core cannot resolve `llm-key` (broker NEVER_RESOLVE) and has no key mount.
+      DEEPSEEK_API_KEY: opaque-ref:${LLM_KEY_REF:-llm-key}
+      BROKER_URL: http://172.28.2.30:8080 # llm egress only
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash} # quota-sensitive default; deepseek-chat on request
+      APPROVAL_TTL_MS: ${APPROVAL_TTL_MS:-300000} # U3: 5 min with no answer -> nothing is written
     volumes:
       - ../data/dsh-home:/home/bot/.dsh
       - work-rw:/rw/work # U2: disposable, tmpfs-backed
@@ -221,6 +228,11 @@ services:
       BROKER_ADMIN_PORT: "8180"
       LLM_UPSTREAM_BASE: ${LLM_UPSTREAM_BASE:-}
       LLM_KEY_REF: llm-key
+      # The broker injects the provider key itself, so it is the one container that must
+      # reach the upstream - but it must get there *through* the C5 allowlist, not around
+      # it. Node's https ignores these variables, hence src/proxy-tunnel.mjs (CONNECT).
+      HTTPS_PROXY: http://172.28.3.40:3128
+      NO_PROXY: 172.28.0.0/16,127.0.0.1
       AUDIT_SINK: /var/log/dshbot/broker.jsonl
     volumes:
       # The only plaintext-bearing mount in the stack, and the only container that can
@@ -240,10 +252,34 @@ services:
   proxy:
     <<: *hardened
     profiles: ["egress"]
-    image: ubuntu/squid:6.10-2404.v1
+    # t3 wrote `ubuntu/squid:6.10-2404.v1`, which has never existed upstream (same class of
+    # phantom reference as the NapCat tag). Real tags are `<ver>-<ubuntu>_beta|_edge`; the
+    # LTS pairing is squid 6.6 on 24.04. Digest-verified from two sources and pinned:
+    #   docker buildx imagetools inspect ubuntu/squid:6.6-24.04_beta
+    #   https://hub.docker.com/v2/repositories/ubuntu/squid/tags/6.6-24.04_beta  (2025-11-24)
+    image: ubuntu/squid:6.6-24.04_beta@sha256:8fafd41d6ddceb295d26eea9938321d825ac5351c7e46cf6a8aa5d093b8ed1ce
     networks:
       net-ops: { ipv4_address: 172.28.3.40 }
+      # The allowlist proxy has to have a route to filter *toward*. This is the only leg
+      # with masquerade enabled in the stack apart from net-qq (the Tencent login servers,
+      # which speak raw TCP/QUIC that squid cannot CONNECT). Nothing else is attached here,
+      # so the policy in rules.conf stays the single place destinations are decided.
+      net-egress: { ipv4_address: 172.28.5.40 }
     read_only: true
+    # Like NapCat, this image drops its own privileges: squid starts as root and calls
+    # setgid/setuid to become `proxy` (uid 13), which a bare cap_drop:[ALL] container cannot
+    # do (`setgid: Operation not permitted`, then a crash loop). Grant exactly the
+    # privilege-dropping caps and nothing more, and pin the run user so the drop has a
+    # target. Recorded as a deviation next to the NapCat one.
+    user: "0:0"
+    cap_add: [SETUID, SETGID, DAC_OVERRIDE, CHOWN]
+    # squid needs writable spool/pid/log dirs under a read-only rootfs. The service-level
+    # tmpfs key replaces the anchor's list, so /tmp is repeated here (t7 lesson).
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run:size=16m,mode=1777
+      - /var/spool/squid:size=128m,mode=1777
+      - /var/log/squid:size=32m,mode=1777
     volumes:
       - ./egress-proxy/rules.conf:/etc/squid/conf.d/dshbot-rules.conf:ro
       - ../logs:/var/log/dshbot
@@ -408,6 +444,15 @@ networks:
   # internet (Tencent login/msf servers speak raw TCP/QUIC, which squid cannot CONNECT).
   # It gets its own masqueraded bridge; no other service joins it, and the container still
   # holds no secrets and cannot see the workspace (isolation stays container-level).
+  net-egress:
+    name: bot-net-egress
+    # The only leg in the stack with masquerade ON besides net-qq, and the only member is
+    # the allowlist proxy. Everything else stays internal-only and reaches the internet no
+    # other way, so rules.conf remains the single place destinations are decided (C5).
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+    ipam: { config: [{ subnet: 172.28.5.0/24 }] }
   net-qq:
     name: bot-net-qq
     driver_opts:
