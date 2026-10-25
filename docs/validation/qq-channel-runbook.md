@@ -222,15 +222,28 @@ bot-core 只挂在 `bot-net-ingress` + `bot-net-agent`（都是 internal），�
 模型流量唯一出路是 broker，而 broker 两张网也全是 internal：容器内直连
 `https://api.deepseek.com` → `fetch failed`。**没有绕行，也没有静默直连可言。**
 
-**代理不可达 = 报错，不是兜底**（临时 `docker stop` 代理后打一次 `/v1/llm/v1/chat/completions`）：
+**代理不可达 = 报错，不是兜底**。10:35 的历史停机样本（临时 `docker stop` 代理后打一次
+`POST /v1/llm/chat/completions`），`logs/broker.jsonl:40` 逐字原文：
 
 ```json
-{"ts":1792896512068,"type":"llm.egress","clientId":"bot-core","result":"error","reason":"proxy-unreachable",
- "message":"proxy CONNECT timed out (172.28.3.40:3128)","ms":5001,"via":"proxy:172.28.3.40:3128"}
+{"ts":1792896512068,"type":"external.message","service":"secret-broker","clientId":"bot-core","result":"error","reason":"proxy-unreachable","message":"proxy CONNECT timed out (172.28.3.40:3128)","ms":5001,"via":"proxy:172.28.3.40:3128"}
 ```
-客户端拿到 `HTTP 502 {"error":{"code":"UPSTREAM_UNREACHABLE"}}`。恢复代理后同一条路径
-`status:200 / via:"proxy:172.28.3.40:3128"`，squid 侧对应
-`TCP_TUNNEL/200 … CONNECT api.deepseek.com:443 HIER_DIRECT/112.13.210.86`。
+
+注意它的 `type` 是 `external.message`，不是 `llm.egress`：该样本产出于词表修复 `dd4e256`
+之前，当时 `emit()` 会把未登记类型统一降级成通用标签。**该样本证明行为（fail-closed 报 502），
+不证明标签**——此前本节把它错引成 `"type":"llm.egress"`，属于文档造假，本次纠正。
+
+`dd4e256` 之后重跑同一故障取 post-fix 真样本（2026-10-25 13:08：token 预算已满，探测请求在
+squid CONNECT 阶段即失败、零 token；恢复验证用零计费的 `GET /v1/llm/models`）。停机样本现在
+如实落在 `llm.egress` 类下，`logs/broker.jsonl:66` 逐字原文：
+
+```json
+{"ts":1792904893909,"type":"llm.egress","service":"secret-broker","clientId":"bot-core","result":"error","reason":"proxy-unreachable","message":"proxy CONNECT timed out (172.28.3.40:3128)","ms":5004,"via":"proxy:172.28.3.40:3128"}
+```
+
+两次客户端都拿到 `HTTP 502 {"error":{"code":"UPSTREAM_UNREACHABLE"}}`。恢复代理后
+`GET /v1/llm/models` → `status:200 / via:"proxy:172.28.3.40:3128"`（`logs/broker.jsonl:68`），
+squid 侧对应 `TCP_TUNNEL/200 6324 CONNECT api.deepseek.com:443 … HIER_DIRECT/39.173.157.74`。
 
 **白名单本身曾经形同虚设（本次修掉的 C5 漏洞）**：Ubuntu 镜像的 `conf.d/debian.conf`
 末尾 `http_access allow localnet` 覆盖了 172.16.0.0/12，而我们的规则按文件名排在它**后面**。
