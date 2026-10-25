@@ -278,7 +278,7 @@ export class CompanionLoop {
       try {
         result = await this.llm.chat({ messages, tools: this.tools.map(toToolSchema) });
       } catch (err) {
-        return { reply: '我现在连不上模型，稍后再试。', pending: false, calls: this.llm.calls - callsBefore, error: err.message };
+        return { reply: llmFailureMessage(err), pending: false, calls: this.llm.calls - callsBefore, error: err.message };
       }
       const callList = result.toolCalls;
       messages.push({ role: 'assistant', content: result.message.content ?? '', ...(callList.length ? { tool_calls: callList } : {}) });
@@ -395,6 +395,21 @@ export class CompanionLoop {
     if (!text) return '（模型这轮没有返回内容）';
     return redactOutbound(text).text.slice(0, 1800);
   }
+}
+
+/**
+ * Which half is actually broken. Every `chat()` failure used to be reported as
+ * "我现在连不上模型", so a healthy tunnel carrying an upstream 400 (a request we assembled
+ * wrongly) read to the owner and to whoever was debugging as a network outage. The audit
+ * already had the truth in `llm.call.reason`; this makes the outbound text agree with it.
+ */
+export function llmFailureMessage(err) {
+  const status = Number(err?.status || 0);
+  if (!status) return '我现在连不上模型，稍后再试。';
+  if (status === 429) return '模型那边限流了，过一会儿再问一次。';
+  if (status === 401 || status === 403) return '模型的凭据不对，这条路我走不了。';
+  if (status >= 500) return '模型那头出错了，稍后再试。';
+  return '模型拒了这轮请求（不是连不上），你可以换个说法再问。';
 }
 
 function shortReason(err) {

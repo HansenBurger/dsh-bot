@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AuditSink } from '@dsh-bot/bot-audit';
-import { approvalWord, ApprovalQueue, BrokerLlmClient, CompanionLoop, toToolSchema } from '../src/llm.mjs';
+import { approvalWord, ApprovalQueue, BrokerLlmClient, CompanionLoop, llmFailureMessage, toToolSchema } from '../src/llm.mjs';
 
 const OWNER = Object.freeze({ channel: 'onebot', chatId: '1035376945', userId: '1035376945', role: 'owner', peerKind: 'dm' });
 const TRUSTED = Object.freeze({ channel: 'onebot', chatId: '222', userId: '222', role: 'trusted', peerKind: 'dm' });
@@ -242,11 +242,21 @@ test('the shared guard still denies: non-owner deletes and foreign subjects', as
 
 test('an unusable model response degrades politely instead of throwing at the gateway', async () => {
   const sink = audit();
-  const broken = { calls: 0, model: 'deepseek-flash', async chat() { this.calls += 1; throw new Error('llm upstream 503'); } };
+  const broken = { calls: 0, model: 'deepseek-flash', async chat() { this.calls += 1; throw Object.assign(new Error('llm upstream 503'), { status: 503 }); } };
   const l = new CompanionLoop({ llm: broken, memory: fakeMemory(), audit: sink, principalOf: () => OWNER, bindPrincipal: () => OWNER, subjectHint: () => 'onebot:dm:1' });
   const out = await l.turn({ text: '在吗', principal: OWNER });
-  assert.match(out.reply, /连不上模型/);
+  assert.match(out.reply, /模型那头出错了/);
   assert.equal(out.calls, 1);
+});
+
+test('a rejected request is not reported as a connection failure', async () => {
+  // 2026-10-25: the owner was told "我现在连不上模型" twice while the tunnel was healthy and
+  // the provider was answering 400. The audit had `reason:"upstream-400"` the whole time.
+  assert.match(llmFailureMessage(Object.assign(new Error('llm upstream 400'), { status: 400 })), /不是连不上/);
+  assert.match(llmFailureMessage(Object.assign(new Error('llm upstream 429'), { status: 429 })), /限流/);
+  assert.match(llmFailureMessage(Object.assign(new Error('llm upstream 401'), { status: 401 })), /凭据/);
+  assert.equal(llmFailureMessage(new Error('fetch failed')), '我现在连不上模型，稍后再试。');
+  assert.doesNotMatch(llmFailureMessage(new Error('fetch failed')), /拒了/);
 });
 
 test('toToolSchema: DSH parameter maps become strict JSON Schema', () => {
