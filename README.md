@@ -136,6 +136,11 @@ scripts/               集成与端到端验证脚本
     我们的规则原名 `dshbot-rules.conf` 排在它后面，于是白名单形同虚设——实测
     `CONNECT example.com:443` 被 `TCP_TUNNEL/200` 打通。现改名
     `a01-dshbot-rules.conf` 抢在 `debian.conf` 之前，并以 `http_access deny all` 收尾。
+    闭合系于文件名字典序本身是脆弱的（t3 审查 R6），两道补偿因此都算数：
+    `scripts/assert-egress-allowlist.sh` 从 broker 容器内实测「allowlist 命中 200 /
+    公网 403 / 内网 403」并检查 conf.d 排序，任何退化非零退出；squid 的 `dstdomain`
+    是后缀语义（放行任意 `*.api.deepseek.com`），真正持 key 的 broker 侧则以
+    exact-host 精确比对上游（`upstream-host-mismatch` 即拒），不让 key 随宽匹配出网。
 11. **审计词表补 `llm.egress`**（同第 6 条的机制）：broker 的模型转发记录（含 fail-closed
     的 `result:"error"`）此前全被改写成 `external.message`，出口轨迹 grep 不出来。
 12. **本栈的“DSH agent 平面”目前是 bot-core 的 standalone 循环**（`BOT_CORE_MODE=llm`：

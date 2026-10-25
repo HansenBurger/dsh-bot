@@ -261,6 +261,21 @@ squid 侧对应 `TCP_TUNNEL/200 6324 CONNECT api.deepseek.com:443 … HIER_DIREC
 改名 `a01-dshbot-rules.conf` 抢在 `debian.conf` 之前即闭合（commit `3e59e92`）。
 也就是说：在 10:35 之前，broker 带着真 key 可以连任意公网地址。
 
+**这个闭合建立在文件名字典序上，是脆弱的（t3 审查 R6）**。squid 按名字顺序 include
+`conf.d/*.conf`，我们的 `deny all` 只有在先于 `debian.conf` 的 `allow localnet` 命中时才终局；
+改个挂载名、镜像升级换 include 语义，白名单都会静默退化成装饰品。所以固化了
+`scripts/assert-egress-allowlist.sh`：S1 检查 conf.d 里 `a01-` 确实排在 `debian.conf` 之前，
+P1–P3 从 broker 容器内对代理做裸 CONNECT 实测——`api.deepseek.com:443` 必须 200、
+`example.com:443` 必须 403、内网 `10.0.0.1:443` 必须 403，任何一条不满足即非零退出
+（2026-10-25 实跑：4 pass 0 fail；探测拿到 200 后立刻丢弃隧道，零字节出网、零 token）。
+
+**第二层补偿：broker 的 exact-host 校验**。squid 的 `dstdomain` 是**后缀语义**——
+`dstdomain api.deepseek.com` 同时放行 `anything.api.deepseek.com`；若哪天有人拿到 DeepSeek
+子域的解析权，代理层看它是"白名单内"。所以真正握着 key 的一方不做后缀信任：
+`index.mjs` 对每个 `/v1/llm/*` 目标做 `target.hostname !== upstreamBase.hostname` 的**精确
+比对**，不相等直接 `sandbox.denied reason=upstream-host-mismatch`，key 永远不会随隧道走到
+第二主机。代理 dstdomain 宽、broker exact-host 严，两层叠起来才是 C5 的完整闭合。
+
 **记忆读写 + 聊天内审批（合成号 `900000001`，不占用真实账号）**
 签名帧直接投 bot-core intake（`POST /submit`），因此只走模型/记忆链路，不触碰 NapCat，
 也不会给真实 QQ 发任何东西：
