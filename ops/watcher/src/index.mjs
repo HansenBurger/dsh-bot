@@ -80,9 +80,14 @@ export function createWatcher(opts = {}) {
     }
   };
 
-  /** TM-014 信号 8: an audit stream that stopped growing. Reported once per stall episode. */
+  /** TM-014 信号 8: an audit stream that stopped growing *while its peers still move*.
+   *  Reported once per stall episode; silence across every stream at once is an idle
+   *  companion, not a stalled writer (see the divergence gate below). */
   const checkGrowth = (now) => {
     const findings = [];
+    // Pass 1: refresh the growth table for every watched file first, so pass 2 judges
+    // peer activity on same-tick data (file order must not decide who counts as active).
+    const stalled = [];
     for (const file of config.logFiles) {
       const path = join(config.logDir, file);
       let st;
@@ -99,8 +104,18 @@ export function createWatcher(opts = {}) {
       }
       growth[path] = { ...seen, size: st.size };
       if (!seen.everGrew) continue; // boot-time baseline: only a stream that *was* growing is "stalled"
-      const ageMs = now - seen.at;
-      if (ageMs >= config.staleLogMs && !stalledReported.has(path)) {
+      stalled.push({ file, path, ageMs: now - seen.at });
+    }
+    // Pass 2: divergence gate — every audited stream here is *event-driven*, so a quiet
+    // evening silences all of them together and must not alert. The stall signal only
+    // means a broken writer when a peer stream moved within the staleness window. This
+    // also breaks the self-feeding loop observed in production, where the alert-relay's
+    // own ingress line reset the stall and re-armed it every idle hour.
+    for (const { file, path, ageMs } of stalled) {
+      const peerActive = Object.entries(growth).some(
+        ([p, g]) => p !== path && g.everGrew && now - g.at < config.staleLogMs,
+      );
+      if (ageMs >= config.staleLogMs && peerActive && !stalledReported.has(path)) {
         stalledReported.add(path);
         findings.push(engine.streamStalled({ file, ageMs }));
       }
