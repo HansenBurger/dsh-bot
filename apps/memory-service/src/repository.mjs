@@ -1059,10 +1059,39 @@ export class MemoryRepository {
 
   /* ---------------------------------------------------------------- *
    * audit (§5.5) — dual-write: JSONL sink is the source of truth (F3)
+   *
+   * T9-F8 (and the DEV-18 disposition from the t8 baseline): until now this was
+   * PG-only, which inverted the declared contract — a PG outage took the whole
+   * access ledger with it and the remote collector never saw the memory leg.
+   * The JSONL mirror goes out *before* the INSERT, so the source of truth cannot
+   * be lost together with the query view. Content bodies are not part of an
+   * access entry (ids, refs, counts only), and the sink redacts/rotates on its
+   * own, so this does not widen D5: a sha256 `object_ref` is still hashed, and
+   * an approval token that trips the high-entropy rule is masked in JSONL while
+   * PG keeps the exact value for reconciliation.
    * ---------------------------------------------------------------- */
 
   async logAccess(entry) {
     const p = entry.principal || {};
+    this.audit?.emit('memory.access', {
+      stage: p.sessionId ? 'agent' : 'service',
+      channel: p.channel ?? null,
+      chatId: p.chatId ?? null,
+      userId: p.userId ?? null,
+      operation: entry.operation ?? null,
+      objectKind: entry.objectKind ?? null,
+      objectRef: entry.objectRef ?? null,
+      class: entry.class_ ?? null,
+      sensitivity: entry.sensitivity ?? null,
+      approved: Boolean(entry.approved),
+      approvalId: entry.approvalId ?? null,
+      result: entry.result || 'allowed',
+      riskTags: entry.riskTags || [],
+      rowsReturned: entry.rowsReturned ?? 0,
+      bytesOut: entry.bytesOut ?? 0,
+      latencyMs: entry.latencyMs ?? null,
+      note: entry.note ?? null,
+    });
     const params = [
       p.sessionId ? 'agent' : 'service',
       p.sessionId || 'memory-service',
