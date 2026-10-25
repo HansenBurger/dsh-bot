@@ -179,7 +179,18 @@ function scrub(node, depth = 0) {
         // Credential-shaped keys/values are masked regardless of length (D5):
         // a DSN passed under an unusual key name must still not leak.
         const looksLikeCredentialValue = /(postgres|postgresql|mysql|mongodb|redis|amqp):\/\/\S/i.test(v) || /\b(?:sk|sk-proj|sk-ant|ghp|gho|xoxb)-[A-Za-z0-9_-]{10,}/.test(v);
-        if (/password|passwd|secret|token|api[_-]?key|dsn|credential|authorization|key$/i.test(k) || looksLikeCredentialValue) {
+        // T9-F2: `chatKey` ended in "Key", so the blanket rule erased every approval
+        // event's conversation binding — while the same identifier is already logged
+        // verbatim as `channel`+`chatId` on neighbouring lines. The rule guards against
+        // credentials under *unknown* field names; a known routing id is not one. The
+        // allowlist only skips the NAME-based mask; value-shape detection and pattern
+        // redaction still apply, so a DSN smuggled under `chatKey` stays `[REDACTED]`.
+        const isCorrelationKey = /^(chatKey|subjectKey|peerKey|attrKey)$/i.test(k);
+        if (!isCorrelationKey && (/password|passwd|secret|token|api[_-]?key|dsn|credential|authorization|key$/i.test(k) || looksLikeCredentialValue)) {
+          out[k] = '[REDACTED]';
+          continue;
+        }
+        if (isCorrelationKey && looksLikeCredentialValue) {
           out[k] = '[REDACTED]';
           continue;
         }

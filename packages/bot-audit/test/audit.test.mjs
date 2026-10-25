@@ -71,3 +71,25 @@ test('the nine audit classes are exported for contract tests', () => {
   ]);
   assert.ok(AUDIT_TYPES.includes('memory.access'));
 });
+
+test('T9-F2: conversation-routing ids keep their value; credential names keep masking', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'audit-f2-'));
+  const path = join(dir, 'agent.jsonl');
+  const sink = new AuditSink({ path, service: 'bot-core' });
+  // The bug this pins: /…|key$/i matched `chatKey` and every approval event lost its
+  // conversation binding, while the SAME identifier sits unmasked as `chatId` on the
+  // neighbouring `agent.turn` line. The allowlist only exempts known routing names.
+  sink.emit('approval.outcome', { stage: 'requested', toolName: 'memory_write', chatKey: 'onebot:1035376945', approvalId: 'appr-0123' });
+  sink.emit('authz.decision', { stage: 'intake', result: 'allowed', role: 'owner' });
+  const lines = readFileSync(path, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines[0].chatKey, 'onebot:1035376945', 'approval events stay attributable to a conversation');
+  // Unchanged behaviour: genuine credential-shaped FIELD NAMES still blank out...
+  sink.emit('credential.resolve', { ref: 'llm-key', secretValue: 'opaque-ref', hmacKey: 'abcd'.repeat(20) });
+  const l2 = JSON.parse(readFileSync(path, 'utf8').trim().split('\n')[2]);
+  assert.equal(l2.hmacKey, '[REDACTED]');
+  assert.equal(l2.secretValue, '[REDACTED]');
+  // ...and credential-SHAPED values are masked even under a routing id name.
+  sink.emit('approval.outcome', { stage: 'requested', chatKey: 'postgres://rw:hunter2@127.0.0.1:5432/dsh' });
+  const l3 = JSON.parse(readFileSync(path, 'utf8').trim().split('\n')[3]);
+  assert.match(l3.chatKey, /\[REDACTED\]/, 'a DSN smuggled under chatKey must not survive the allowlist');
+});
