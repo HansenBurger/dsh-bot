@@ -561,13 +561,25 @@ export class MemoryRepository {
         }
         return;
       case 'private':
-      default:
+      default: {
         // private: readable by the subject themself in their own DM, or by the owner
         // of the row's identity (never merely by "some" owner on some channel).
-        const isOwnDm = rowPeer === peerKey && principal.role !== 'public';
+        //
+        // DEV-20: this arm used to be `rowPeer === channel:chatId`, and the chat id is the
+        // one field that says *where* a call came from rather than *who* is calling — §3
+        // shape 4 (a `trusted` caller reporting the master's DM number) read the master's
+        // private rows straight through it. §5.6's rule is "仅 subject 本人在其 DM 会话
+        // 可读", so the peer arm now names the caller's own DM (`channel:userId`), and the
+        // subject link stands on its own (peer-less KV *and* rows filed under our subject,
+        // exactly like `f.subject_id = $5 OR f.subject_id = $6` in the SQL legs). The owner
+        // keeps the wider own-chat arm through `ownerSelf`, which is itself identity-bound
+        // (R2). These three arms are the same predicate as preference/episode SQL above.
+        const ownDmPeer = `${principal.channel}:${principal.userId}`;
+        const isOwnDm = rowPeer !== null && rowPeer === ownDmPeer && principal.role !== 'public';
         // Review N1: peer-less private KV (profiles, global prefs) is scoped by subject.
-        const isSelfSubject = rowPeer === null && this.#subjectIsCaller(row, principal);
+        const isSelfSubject = this.#subjectIsCaller(row, principal);
         if (!isOwnDm && !isSelfSubject && !ownerSelf) throw new ServiceError('ACL_DENIED', '记忆不存在或不可见', 404);
+      }
     }
   }
 
@@ -615,13 +627,20 @@ export class MemoryRepository {
     // rows filed under channel:dm:userId, or banked in the caller's own DM peer.
     // A second owner entry on another channel matches neither and reads nothing.
     const ownerSelf = "(e.peer_key = $1 || ':' || $5 OR e.subject_id = $6)";
+    // DEV-20: `private` (§5.6 "仅 subject 本人在其 DM 会话可读") used to be opened by the
+    // same bare peer equality as `peer`, and a peer equality is a claim about *where* the
+    // row lives, not *whose* row it is — §3 shape 4 (a `trusted` caller reporting the
+    // master's DM chat) hit real private rows through it. `peer` keeps its chat-scoped
+    // route (that is what the class means); `private` now needs the subject link, the
+    // caller's own DM peer, or the owner of that chat. Same three arms as the JS boundary.
     const epWhere = [
       'e.superseded_by IS NULL',
       '(e.expires_at IS NULL OR e.expires_at > now())',
       // ACL predicate lives in SQL, not in JS string concatenation (§5.6).
       `(
            (e.visibility = 'owner' AND $3 = 'owner' AND ${ownerSelf})
-        OR (e.visibility IN ('private','peer') AND (e.peer_key = $1 || ':' || $2 OR ($3 = 'owner' AND ${ownerSelf})))
+        OR (e.visibility = 'peer' AND (e.peer_key = $1 || ':' || $2 OR ($3 = 'owner' AND ${ownerSelf})))
+        OR (e.visibility = 'private' AND (${ownerSelf} OR ($3 = 'owner' AND e.peer_key = $1 || ':' || $2)))
        )`,
       "companion.byte_trgm(coalesce(e.body_plain, '')) && companion.byte_trgm($4)",
     ];
@@ -661,6 +680,14 @@ export class MemoryRepository {
     //      peer key, so the identity predicate is the *subject* link ($5 own dm,
     //      $6 own group), with the preference leg additionally honouring rows filed
     //      in the caller's own chat ($7:$8). Same construction as the episode leg.
+    //      DEV-20 tightened that last part: a peer match is a *location*, not an
+    //      identity. §5.6 says `private` is "仅 subject 本人在其 DM 会话可读" (the write
+    //      default at line 217 makes dm/global rows private and group rows peer), so a
+    //      scope_peer hit alone now only opens a private row for the owner of that chat.
+    //      A caller that reports `chat` as the master's DM number while being `trusted`
+    //      matches nothing: the private row's subject is neither $5 nor $6, and the peer
+    //      leg is gated on role. The episode leg is tightened the same way below, so SQL
+    //      and the JS boundary in `assertVisible` stay one and the same predicate.
     const kvParams = [
       req.query,
       principal.role,
@@ -669,8 +696,9 @@ export class MemoryRepository {
       principal.dmSubjectId ?? null,
       principal.groupSubjectId ?? null,
     ];
-    // the preference leg additionally binds the caller's own chat for scope_peer
-    const prefParams = [...kvParams, principal.channel, principal.chatId];
+    // the preference leg additionally binds the caller's own chat for scope_peer,
+    // and their own user id ($9) for the "本人在其 DM 会话" arm of `private` (DEV-20).
+    const prefParams = [...kvParams, principal.channel, principal.chatId, principal.userId];
     const kvSql = `
       SELECT p.profile_id AS memory_id, 'profile' AS kind, p.subject_id, NULL::text AS peer_key,
              'profile' AS class, p.attr_key, p.value_plain AS body_plain, p.value_enc AS body_enc,
@@ -697,7 +725,9 @@ export class MemoryRepository {
         FROM companion.user_preference f
        WHERE f.visibility <> 'admin'
          AND (f.visibility <> 'owner' OR ($2 = 'owner' AND f.subject_id = $5))
-         AND (f.subject_id = $5 OR f.subject_id = $6 OR f.scope_peer = $7 || ':' || $8)
+         AND (f.subject_id = $5 OR f.subject_id = $6
+              OR (f.scope_peer = $7 || ':' || $8 AND (f.visibility = 'peer' OR $2 = 'owner'))
+              OR (f.scope_peer = $7 || ':' || $9 AND $2 <> 'public'))
          AND (companion.byte_trgm(coalesce(f.value_plain, '')) && companion.byte_trgm($1)
               OR lower(coalesce(f.value_plain, '')) LIKE '%' || $3 || '%'
               OR lower(f.pref_key) LIKE '%' || $3 || '%')

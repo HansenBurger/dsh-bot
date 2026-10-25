@@ -187,7 +187,18 @@ test('N1: a trusted search binds both KV legs to its own subjects, never to the 
   // pre-N1 these clauses did not exist at all: any trusted caller fetched the master's
   // private profile/preference rows, because the KV legs filtered visibility only.
   assert.match(kv.sql, /\(p\.subject_id = \$5 OR p\.subject_id = \$6\)/);
-  assert.match(pref.sql, /\(f\.subject_id = \$5 OR f\.subject_id = \$6 OR f\.scope_peer = \$7 \|\| ':' \|\| \$8\)/);
+  // DEV-20: the bare `f.scope_peer = $7 || ':' || $8` disjunct is gone — a peer equality
+  // says where the row lives, not whose row it is. Each remaining peer arm is gated.
+  const prefFlat = pref.sql.replace(/\s+/g, ' ');
+  assert.match(
+    prefFlat,
+    /AND \(f\.subject_id = \$5 OR f\.subject_id = \$6 OR \(f\.scope_peer = \$7 \|\| ':' \|\| \$8 AND \(f\.visibility = 'peer' OR \$2 = 'owner'\)\) OR \(f\.scope_peer = \$7 \|\| ':' \|\| \$9 AND \$2 <> 'public'\)\)/,
+    'the preference leg binds every peer route to role or to the caller’s own DM',
+  );
+  assert.ok(
+    !/OR f\.scope_peer = \$7 \|\| ':' \|\| \$8\)/.test(prefFlat),
+    'no ungated scope_peer disjunct remains (the DEV-20 shape-4 hole)',
+  );
   assert.equal(kv.params[4], TRUSTED_SUBJECT, 'the trusted caller binds its own dm subject');
   assert.equal(kv.params[5], null, 'a DM call resolves no group subject');
   assert.ok(
@@ -223,4 +234,93 @@ test('N1: peer-less KV rows are subject-bound through read() as well', async () 
   // and 'peer'-visibility without a peer dimension no longer falls through to everyone
   const rPeer = repo(fakePg({ rows: [profileRow({ subject_id: MASTER_SUBJECT, visibility: 'peer' })] }));
   await assert.rejects(rPeer.read(ROW_UUID, trusted()), (e) => e.status === 404);
+});
+
+/* ---------------- DEV-20: a peer equality is a location, not an identity ---------------- */
+
+/**
+ * §3 shape 4 of the baseline: the caller is `trusted`, but reports `chat` as the master's
+ * DM number (a channel adapter that fills chat_id with the *mentioned* peer, a group whose
+ * id collides with a DM number, a buggy future connector). Before DEV-20 the private legs
+ * matched `scope_peer = channel || ':' || chatId` with no subject and no role check, so this
+ * caller fetched rows that belong to the master. The probe must now return nothing — while
+ * shape 3, the master in their own DM, keeps returning exactly one row.
+ */
+const forgedMasterChat = () => ({
+  channel: 'onebot',
+  chatId: MASTER, // <- the master's DM number, claimed by somebody else
+  userId: TRUSTED_ID,
+  role: 'trusted',
+  dmSubjectId: TRUSTED_SUBJECT,
+  groupSubjectId: null,
+});
+
+test('DEV-20 shape 4: a forged-chat trusted caller reads the master’s private row as 404', async () => {
+  const pg = fakePg({ rows: [privateRow()] });
+  const r = repo(pg);
+  await assert.rejects(r.read(ROW_UUID, forgedMasterChat()), (e) => e.status === 404, 'the peer arm must not open a private row for a bystander');
+  // the same row is still readable by the master whose DM it is
+  const master = { ...qqOwner(), dmSubjectId: MASTER_SUBJECT };
+  assert.equal((await r.read(ROW_UUID, master)).body, '主人喜欢香菜');
+});
+
+test('DEV-20 shape 4: assertVisible rejects the forged peer even when it equals the caller’s chat', () => {
+  const r = repo(fakePg());
+  const forged = forgedMasterChat();
+  assert.equal(`${forged.channel}:${forged.chatId}`, `onebot:${MASTER}`, 'the forged principal does present the master’s DM peer');
+  assert.throws(() => r.assertVisible(privateRow(), forged), (e) => e.status === 404);
+  assert.throws(() => r.assertVisible(privateRow({ visibility: 'private', class: 'preference' }), forged), (e) => e.status === 404);
+  // a public caller gets nothing either, even in their own DM
+  assert.throws(
+    () => r.assertVisible(privateRow({ peer_key: `onebot:${TRUSTED_ID}`, subject_id: 'x' }), { ...forged, role: 'public', dmSubjectId: null }),
+    (e) => e.status === 404,
+  );
+  // ...and the trusted caller keeps their OWN dm rows (the tightening is not a recall loss)
+  r.assertVisible(privateRow({ peer_key: `onebot:${TRUSTED_ID}`, subject_id: TRUSTED_SUBJECT }), forged);
+  r.assertVisible(privateRow({ peer_key: `onebot:${TRUSTED_ID}`, subject_id: 'unbacked-subject' }), trusted());
+});
+
+test('DEV-20: group memory is untouched — a `peer` row is still shared inside its own chat', () => {
+  const r = repo(fakePg());
+  const inGroup = { channel: 'onebot', chatId: '222', userId: TRUSTED_ID, role: 'trusted' };
+  r.assertVisible(privateRow({ visibility: 'peer', peer_key: 'onebot:222', subject_id: GROUP_SUBJECT }), inGroup);
+  // another chat, same caller: still denied
+  assert.throws(
+    () => r.assertVisible(privateRow({ visibility: 'peer', peer_key: 'onebot:222', subject_id: GROUP_SUBJECT }), { ...inGroup, chatId: '333' }),
+    (e) => e.status === 404,
+  );
+});
+
+test('DEV-20: every peer route in the retrieval SQL is gated by role or by the caller’s own DM', async () => {
+  const pg = fakePg();
+  const r = repo(pg);
+  await r.search({ query: '香菜' }, forgedMasterChat());
+
+  const pref = pg.calls.find((c) => c.sql.includes('FROM companion.user_preference f'));
+  const prefFlat = pref.sql.replace(/\s+/g, ' ');
+  assert.deepEqual([pref.params[6], pref.params[7], pref.params[8]], ['onebot', MASTER, TRUSTED_ID], 'channel, claimed chat, own user id');
+  assert.ok(/f\.visibility = 'peer' OR \$2 = 'owner'/.test(prefFlat), 'the chat-scoped arm only opens peer rows, or for the owner of that chat');
+  assert.ok(/f\.scope_peer = \$7 \|\| ':' \|\| \$9 AND \$2 <> 'public'/.test(prefFlat), 'the own-DM arm is bound to the caller’s user id, not to their chat claim');
+  assert.ok(!prefFlat.includes("OR f.scope_peer = $7 || ':' || $8)"), 'no ungated peer disjunct remains in the preference leg');
+
+  const ep = pg.calls.find((c) => c.sql.includes('FROM companion.memory_episode e'));
+  const epFlat = ep.sql.replace(/\s+/g, ' ');
+  assert.match(epFlat, /\(e\.visibility = 'private' AND \(\(e\.peer_key = \$1 \|\| ':' \|\| \$5 OR e\.subject_id = \$6\) OR \(\$3 = 'owner' AND e\.peer_key = \$1 \|\| ':' \|\| \$2\)\)\)/, 'the episode leg splits private from peer the same way');
+  assert.match(epFlat, /\(e\.visibility = 'peer' AND \(e\.peer_key = \$1 \|\| ':' \|\| \$2 OR \(\$3 = 'owner' AND \(e\.peer_key = \$1 \|\| ':' \|\| \$5 OR e\.subject_id = \$6\)\)\)\)/);
+  assert.ok(!/e\.visibility IN \('private','peer'\)/.test(epFlat), 'private and peer no longer share one ungated arm');
+
+  // R2's identity-bound owner bypass must still be there, unchanged
+  assert.ok(/\$3 = 'owner' AND \(e\.peer_key = \$1 \|\| ':' \|\| \$5 OR e\.subject_id = \$6\)/.test(epFlat));
+});
+
+test('DEV-20 shape 3: the master’s own recall keeps both routes (subject link and own DM)', async () => {
+  const pg = fakePg();
+  const r = repo(pg);
+  await r.search({ query: '香菜' }, qqOwner());
+  const pref = pg.calls.find((c) => c.sql.includes('FROM companion.user_preference f'));
+  const ep = pg.calls.find((c) => c.sql.includes('FROM companion.memory_episode e'));
+  assert.equal(pref.params[4], MASTER_SUBJECT, 'the owner binds their own dm subject');
+  assert.equal(pref.params[8], MASTER, 'and their own user id for the own-DM arm');
+  assert.equal(ep.params[4], MASTER);
+  assert.equal(ep.params[5], MASTER_SUBJECT);
 });
